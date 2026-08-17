@@ -1,0 +1,31 @@
+{
+  "variant": "qk4-s4",
+  "seed": 0,
+  "parameters": 16969776,
+  "device": "NVIDIA GeForce MX570 A",
+  "amp_dtype": "torch.bfloat16",
+  "micro_batch": 8,
+  "effective_batch": 8,
+  "sequence_length": 64,
+  "training_tokens": 4113234,
+  "validation_tokens": 216486,
+  "start_step": 0,
+  "steps": 2,
+  "schedule_steps": 12000,
+  "tokens_seen": 1024,
+  "robust_a": 7.845737285912037,
+  "robust_b": 7.850082606077194,
+  "robust_mean": 7.8479099459946156,
+  "perplexity": 2560.377393628614,
+  "history": [
+    {
+      "step": 2,
+      "train_loss": 7.8441162109375,
+      "validation_loss": 7.832313597202301,
+      "tokens_seen": 1024,
+      "learning_rate": 2e-06,
+      "chunk_seconds": 1.342360245999771,
+      "max_memory_mib": 348.03759765625
+    }
+  ]
+}

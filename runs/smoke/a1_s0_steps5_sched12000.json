@@ -1,0 +1,31 @@
+{
+  "variant": "a1",
+  "seed": 0,
+  "parameters": 15527942,
+  "device": "NVIDIA GeForce MX570 A",
+  "amp_dtype": "torch.bfloat16",
+  "micro_batch": 4,
+  "effective_batch": 8,
+  "sequence_length": 64,
+  "training_tokens": 4113234,
+  "validation_tokens": 216486,
+  "start_step": 0,
+  "steps": 5,
+  "schedule_steps": 12000,
+  "tokens_seen": 2560,
+  "robust_a": 7.770517349243164,
+  "robust_b": 7.768931515514851,
+  "robust_mean": 7.769724432379007,
+  "perplexity": 2367.8187042766804,
+  "history": [
+    {
+      "step": 5,
+      "train_loss": 7.8468017578125,
+      "validation_loss": 7.847863674163818,
+      "tokens_seen": 2560,
+      "learning_rate": 4.9999999999999996e-06,
+      "chunk_seconds": 1.3633580529999563,
+      "max_memory_mib": 325.0810546875
+    }
+  ]
+}

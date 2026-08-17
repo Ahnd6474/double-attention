@@ -1,0 +1,104 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from typing import Literal
+
+
+Backend = Literal["auto", "torch", "triton"]
+MapCombine = Literal["weighted_sum", "concat"]
+
+
+@dataclass(frozen=True)
+class DoubleAttentionConfig:
+    """Configuration for one shared-dictionary attention experiment.
+
+    ``routing_dim`` is the width of *each* Q/K branch.  The total Q/K
+    projection width is therefore ``routing_dim * qk_branches``.
+    """
+
+    model_dim: int = 512
+    routing_dim: int = 256
+    dictionary_size: int = 512
+    qk_branches: int = 1
+    outer_maps: int = 1
+    beta: float = 4.0
+    initial_score_scale: float = 16.0
+    learnable_beta: bool = False
+    untied_dictionary: bool = True
+    output_projection: bool = True
+    value_bias: bool = True
+    map_combine: MapCombine = "weighted_sum"
+    causal: bool = True
+    backend: Backend = "auto"
+    eps: float = 1e-6
+
+    def __post_init__(self) -> None:
+        positive = {
+            "model_dim": self.model_dim,
+            "routing_dim": self.routing_dim,
+            "dictionary_size": self.dictionary_size,
+            "qk_branches": self.qk_branches,
+            "outer_maps": self.outer_maps,
+            "beta": self.beta,
+            "initial_score_scale": self.initial_score_scale,
+            "eps": self.eps,
+        }
+        for name, value in positive.items():
+            if value <= 0:
+                raise ValueError(f"{name} must be positive, got {value!r}")
+        larger = max(self.qk_branches, self.outer_maps)
+        smaller = min(self.qk_branches, self.outer_maps)
+        if larger % smaller:
+            raise ValueError(
+                "qk_branches and outer_maps must divide one another so score "
+                "maps can be grouped or repeated without an ambiguous mapping"
+            )
+        if self.backend not in {"auto", "torch", "triton"}:
+            raise ValueError(f"unsupported backend: {self.backend}")
+        if self.map_combine not in {"weighted_sum", "concat"}:
+            raise ValueError(f"unsupported map_combine: {self.map_combine}")
+        if self.map_combine == "concat" and not self.output_projection:
+            raise ValueError("concat map combination requires output_projection=True")
+
+    @property
+    def total_qk_width(self) -> int:
+        return self.routing_dim * self.qk_branches
+
+    def with_updates(self, **updates: object) -> "DoubleAttentionConfig":
+        return replace(self, **updates)
+
+
+_PRESETS: dict[str, tuple[int, int, int]] = {
+    # name: (Q/K projections, outer softmax maps, routing width per branch)
+    "a1": (1, 1, 256),
+    "qk2-s1": (2, 1, 256),
+    "qk1-s2": (1, 2, 256),
+    "qk2-s2": (2, 2, 256),
+    "qk4-s4": (4, 4, 128),
+}
+
+
+def experiment_config(name: str, **overrides: object) -> DoubleAttentionConfig:
+    """Build one of the experiment variants recorded in the project.
+
+    QK2 variants use two 256-wide branches (512 total Q/K width).  QK4-S4
+    uses four 128-wide branches, matching the head width of MHA4 at d=512.
+    """
+
+    key = name.lower().replace("_", "-")
+    try:
+        qk_branches, outer_maps, routing_dim = _PRESETS[key]
+    except KeyError as exc:
+        choices = ", ".join(sorted(_PRESETS))
+        raise ValueError(f"unknown experiment {name!r}; choose one of: {choices}") from exc
+    values: dict[str, object] = {
+        "qk_branches": qk_branches,
+        "outer_maps": outer_maps,
+        "routing_dim": routing_dim,
+    }
+    values.update(overrides)
+    return DoubleAttentionConfig(**values)
+
+
+def experiment_names() -> tuple[str, ...]:
+    return tuple(_PRESETS)

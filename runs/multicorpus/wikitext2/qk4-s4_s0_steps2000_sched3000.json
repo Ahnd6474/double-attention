@@ -1,0 +1,61 @@
+{
+  "variant": "qk4-s4",
+  "dictionary": "untied",
+  "corpus": "wikitext2",
+  "vocab_size": 2048,
+  "seed": 0,
+  "parameters": 16969776,
+  "device": "NVIDIA GeForce MX570 A",
+  "amp_dtype": "torch.bfloat16",
+  "micro_batch": 8,
+  "effective_batch": 8,
+  "sequence_length": 64,
+  "training_tokens": 4763178,
+  "validation_tokens": 250694,
+  "start_step": 0,
+  "steps": 2000,
+  "schedule_steps": 3000,
+  "tokens_seen": 1024000,
+  "robust_a": 4.063361670821905,
+  "robust_b": 4.0859406143426895,
+  "robust_mean": 4.074651142582297,
+  "perplexity": 58.829953742338205,
+  "history": [
+    {
+      "step": 100,
+      "train_loss": 5.668861389160156,
+      "validation_loss": 5.787781864404678,
+      "tokens_seen": 51200,
+      "learning_rate": 0.00039999999999999996,
+      "chunk_seconds": 8.531682984999861,
+      "max_memory_mib": 348.03759765625
+    },
+    {
+      "step": 500,
+      "train_loss": 4.664154052734375,
+      "validation_loss": 4.827412128448486,
+      "tokens_seen": 256000,
+      "learning_rate": 0.0005779482201644404,
+      "chunk_seconds": 28.82151338599988,
+      "max_memory_mib": 348.03759765625
+    },
+    {
+      "step": 1000,
+      "train_loss": 4.390037536621094,
+      "validation_loss": 4.4928403198719025,
+      "tokens_seen": 512000,
+      "learning_rate": 0.000477670575799494,
+      "chunk_seconds": 36.506251132000216,
+      "max_memory_mib": 348.03759765625
+    },
+    {
+      "step": 2000,
+      "train_loss": 4.180133819580078,
+      "validation_loss": 4.11930438876152,
+      "tokens_seen": 1024000,
+      "learning_rate": 0.00016453999250673324,
+      "chunk_seconds": 70.37676746399984,
+      "max_memory_mib": 348.03759765625
+    }
+  ]
+}

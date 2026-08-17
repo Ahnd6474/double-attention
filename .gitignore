@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+benchmark_results/
+data/
+runs/**/*.pt
+runs/**/*.tmp
+runs/**/*.log
+runs/multicorpus_variable_vocab_pilot/
+runs/confirmation_v2_smoke/

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "double-attention"
+version = "0.1.0"
+description = "Experimental shared-dictionary low-dimensional attention modules and Triton kernels"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.2"]
+
+[project.optional-dependencies]
+data = ["pyarrow>=17", "sentencepiece>=0.2"]
+gpu = ["triton>=3.0; platform_system != 'Windows'"]
+test = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
