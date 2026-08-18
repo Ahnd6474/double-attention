@@ -1,0 +1,62 @@
+{
+  "variant": "qk1-s2",
+  "dictionary": "tied",
+  "corpus": "python_code",
+  "vocab_size": 2048,
+  "seed": 0,
+  "parameters": 15396888,
+  "device": "NVIDIA GeForce RTX 5060 Laptop GPU",
+  "amp_dtype": "torch.bfloat16",
+  "micro_batch": 8,
+  "effective_batch": 8,
+  "sequence_length": 64,
+  "training_tokens": 5421380,
+  "validation_tokens": 285336,
+  "test_tokens": 0,
+  "start_step": 0,
+  "steps": 2000,
+  "schedule_steps": 3000,
+  "tokens_seen": 1024000,
+  "robust_a": 3.873888861387968,
+  "robust_b": 3.8989859484136105,
+  "robust_mean": 3.8864374049007893,
+  "perplexity": 48.736946861370086,
+  "history": [
+    {
+      "step": 100,
+      "train_loss": 5.453155517578125,
+      "validation_loss": 5.802349001169205,
+      "tokens_seen": 51200,
+      "learning_rate": 0.00039999999999999996,
+      "chunk_seconds": 3.600606100000732,
+      "max_memory_mib": 372.41748046875
+    },
+    {
+      "step": 500,
+      "train_loss": 4.158890724182129,
+      "validation_loss": 4.587565213441849,
+      "tokens_seen": 256000,
+      "learning_rate": 0.0005779482201644404,
+      "chunk_seconds": 10.43975739999587,
+      "max_memory_mib": 372.41748046875
+    },
+    {
+      "step": 1000,
+      "train_loss": 3.609194278717041,
+      "validation_loss": 4.23950257897377,
+      "tokens_seen": 512000,
+      "learning_rate": 0.000477670575799494,
+      "chunk_seconds": 13.008961999999883,
+      "max_memory_mib": 372.41748046875
+    },
+    {
+      "step": 2000,
+      "train_loss": 3.5016016960144043,
+      "validation_loss": 3.7803214639425278,
+      "tokens_seen": 1024000,
+      "learning_rate": 0.00016453999250673324,
+      "chunk_seconds": 25.458776400002535,
+      "max_memory_mib": 372.41748046875
+    }
+  ]
+}

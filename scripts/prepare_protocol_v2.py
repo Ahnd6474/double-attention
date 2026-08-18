@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sysconfig
 from pathlib import Path
 
 import pyarrow.parquet as parquet
@@ -71,7 +72,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", type=Path, default=Path("data/protocol_v2"))
     parser.add_argument("--source-dir", type=Path, default=Path("data/multicorpus/sources"))
-    parser.add_argument("--python-stdlib", type=Path, default=Path("/usr/lib/python3.12"))
+    parser.add_argument(
+        "--python-stdlib",
+        type=Path,
+        default=Path(sysconfig.get_path("stdlib")),
+    )
     parser.add_argument("--vocab-size", type=int, default=2048)
     parser.add_argument("--tokenizer-characters-per-corpus", type=int, default=1_000_000)
     args = parser.parse_args()

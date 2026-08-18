@@ -76,7 +76,25 @@ model = DoubleAttentionLM(
 `backend="auto"` uses Triton for CUDA fp16/bf16 tensors and falls back to the
 fully differentiable PyTorch reference elsewhere. The GPU path contains:
 
-- fused row L2-normalization forward and backward;
+- one dictionary normalization per shared bank and stack forward, rather than
+  repeating the same normalization graph in every layer that uses the bank;
+- one combined Q/K projection GEMM while retaining the original
+  `query.weight` and `key.weight` parameters for checkpoint compatibility;
+- fused row L2-normalization forward and backward, with saved inverse norms so
+  backward does not recompute row norms or retain the pre-normalized routing
+  activation;
+- an RTX 50-series fast path that fuses input row normalization with the
+  standard 256-by-512 dictionary assignment GEMM for up to 1,024 routing rows,
+  with automatic cuBLAS fallback outside the measured winning range;
+- a fully fused RTX 50-series dictionary-route forward kernel for the standard
+  128/256 routing widths and 512 atoms. It performs normalization, assignment,
+  temperature softmax, reconstruction, and output normalization in one launch
+  for up to 4,096 rows while writing the tensors required by backward;
+- a matching fused dictionary-route backward kernel that combines output
+  normalization backward, value projection, softmax backward, key projection,
+  and input normalization backward. Only the two dictionary-parameter gradient
+  GEMMs remain delegated to PyTorch/cuBLAS. The measured cutoff is 4,096 rows
+  at routing width 128 and 2,048 rows at width 256;
 - fused temperature-scaled dictionary softmax forward and backward;
 - a Flash-style causal routed-attention forward kernel that never materializes
   the `[T, T]` score/probability matrices and reuses one dense value tensor for
@@ -88,8 +106,9 @@ fully differentiable PyTorch reference elsewhere. The GPU path contains:
   by the `dQ` and `dK` kernels; larger cases automatically use the matrix-free
   recomputation path. Scores and probabilities are never materialized.
 
-Dictionary GEMMs remain delegated to PyTorch/cuBLAS in both directions. The
-custom autograd functions do not support higher-order gradients.
+Unsupported dictionary shapes and pre-RTX-50 GPUs automatically use the
+multi-kernel path, where dictionary GEMMs remain delegated to PyTorch/cuBLAS.
+The custom autograd functions do not support higher-order gradients.
 
 On the NVIDIA GeForce MX570 A with BF16, batch 2, and sequence length 64, a
 full attention-module forward+backward step measured:
@@ -121,15 +140,29 @@ three-seed quality experiment.
 Install and test:
 
 ```bash
-pip install -e ".[test,gpu]"
-pytest
-python benchmarks/benchmark_attention.py --variant qk2-s2 --backend triton
-python benchmarks/benchmark_attention.py --variant qk2-s2 --backend triton \
+uv sync --extra test --extra gpu --extra data
+uv run python scripts/check_environment.py
+uv run pytest
+uv run python benchmarks/benchmark_attention.py --variant qk2-s2 --backend triton
+uv run python benchmarks/benchmark_attention.py --variant qk2-s2 --backend triton \
   --batch 2 --sequence 64 --dtype bf16 --backward
-python benchmarks/benchmark_attention.py --variant qk2-s2 \
+uv run python benchmarks/benchmark_attention.py --variant qk2-s2 \
   --batch 2 --sequence 64 --dtype bf16 --backward --compare
-python benchmarks/benchmark_lm_training.py --variant qk4-s4 \
+uv run python benchmarks/benchmark_lm_training.py --variant qk4-s4 \
   --batch 8 --sequence 64 --dtype bf16
+```
+
+The repository pins Python 3.12, PyTorch 2.12 with CUDA 13.0, and the matching
+Triton 3.7 series in `uv.lock`. On native Windows the `gpu` extra installs
+`triton-windows`; Linux uses the upstream `triton` package. Run commands through
+`uv run` or activate `.venv` first.
+
+To prepare the lightweight Python-documentation corpus and launch a short
+end-to-end smoke experiment:
+
+```bash
+uv run python scripts/prepare_docs_corpus.py
+uv run python scripts/train_screen.py --variant qk4-s4 --steps 10 --schedule-steps 10 --warmup 2 --micro-batch 2 --effective-batch 2 --eval-batches 2 --backend triton --output-dir runs/smoke
 ```
 
 For the local WSL GPU environment prepared for this project, source the helper

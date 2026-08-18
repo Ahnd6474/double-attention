@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sysconfig
 from pathlib import Path
 
 import pyarrow.parquet as parquet
@@ -99,7 +100,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", type=Path, default=Path("data/multicorpus"))
     parser.add_argument("--docs", type=Path, default=Path("data/docs_sp2048/corpus.txt"))
-    parser.add_argument("--python-stdlib", type=Path, default=Path("/usr/lib/python3.12"))
+    parser.add_argument(
+        "--python-stdlib",
+        type=Path,
+        default=Path(sysconfig.get_path("stdlib")),
+    )
     parser.add_argument("--vocab-size", type=int, default=2048)
     parser.add_argument("--tokenizer-characters-per-corpus", type=int, default=1_000_000)
     args = parser.parse_args()

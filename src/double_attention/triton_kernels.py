@@ -15,6 +15,12 @@ except (ImportError, OSError):  # OSError also covers unsupported binary builds.
 
 
 MAX_PRECOMPUTED_DP_BYTES = 16 * 1024 * 1024
+FUSED_DICTIONARY_ASSIGNMENT = True
+FUSED_DICTIONARY_ASSIGNMENT_MAX_ROWS = 1024
+FUSED_DICTIONARY_ROUTE = True
+FUSED_DICTIONARY_ROUTE_MAX_ROWS = 4096
+FUSED_DICTIONARY_ROUTE_BACKWARD = True
+FUSED_DICTIONARY_ROUTE_BACKWARD_MAX_ROWS_R256 = 2048
 
 
 if TRITON_AVAILABLE:
@@ -23,6 +29,7 @@ if TRITON_AVAILABLE:
     def _row_l2_normalize_kernel(
         input_ptr,
         output_ptr,
+        inverse_norm_ptr,
         input_row_stride,
         output_row_stride,
         n_cols: tl.constexpr,
@@ -35,6 +42,407 @@ if TRITON_AVAILABLE:
         values = tl.load(input_ptr + row * input_row_stride + columns, mask=mask, other=0.0).to(tl.float32)
         inverse_norm = tl.rsqrt(tl.sum(values * values, axis=0) + eps)
         tl.store(output_ptr + row * output_row_stride + columns, values * inverse_norm, mask=mask)
+        tl.store(inverse_norm_ptr + row, inverse_norm)
+
+
+    @triton.jit
+    def _normalized_assignment_kernel(
+        input_ptr,
+        dictionary_key_ptr,
+        normalized_ptr,
+        inverse_norm_ptr,
+        logits_ptr,
+        input_row_stride,
+        dictionary_key_row_stride,
+        normalized_row_stride,
+        logits_row_stride,
+        rows,
+        routing_dim: tl.constexpr,
+        dictionary_size: tl.constexpr,
+        eps: tl.constexpr,
+        IS_BF16: tl.constexpr,
+        BLOCK_R: tl.constexpr,
+        BLOCK_ROWS: tl.constexpr,
+        BLOCK_DICTIONARY: tl.constexpr,
+    ):
+        row_block = tl.program_id(0)
+        dictionary_block = tl.program_id(1)
+        row_offsets = row_block * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+        routing_offsets = tl.arange(0, BLOCK_R)
+        dictionary_offsets = (
+            dictionary_block * BLOCK_DICTIONARY + tl.arange(0, BLOCK_DICTIONARY)
+        )
+        row_mask = row_offsets < rows
+        routing_mask = routing_offsets < routing_dim
+        dictionary_mask = dictionary_offsets < dictionary_size
+
+        values = tl.load(
+            input_ptr
+            + row_offsets[:, None] * input_row_stride
+            + routing_offsets[None, :],
+            mask=row_mask[:, None] & routing_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        inverse_norm = tl.rsqrt(tl.sum(values * values, axis=1) + eps)
+        normalized = values * inverse_norm[:, None]
+        if IS_BF16:
+            normalized_for_dot = normalized.to(tl.bfloat16)
+        else:
+            normalized_for_dot = normalized.to(tl.float16)
+        dictionary_key = tl.load(
+            dictionary_key_ptr
+            + routing_offsets[:, None] * dictionary_key_row_stride
+            + dictionary_offsets[None, :],
+            mask=routing_mask[:, None] & dictionary_mask[None, :],
+            other=0.0,
+        )
+        logits = tl.dot(normalized_for_dot, dictionary_key)
+        tl.store(
+            logits_ptr
+            + row_offsets[:, None] * logits_row_stride
+            + dictionary_offsets[None, :],
+            logits,
+            mask=row_mask[:, None] & dictionary_mask[None, :],
+        )
+
+        # Only the first dictionary tile owns the reusable normalization
+        # outputs. Other tiles recompute the row norm locally for their GEMM.
+        first_dictionary_tile = dictionary_block == 0
+        tl.store(
+            normalized_ptr
+            + row_offsets[:, None] * normalized_row_stride
+            + routing_offsets[None, :],
+            normalized,
+            mask=first_dictionary_tile & row_mask[:, None] & routing_mask[None, :],
+        )
+        tl.store(
+            inverse_norm_ptr + row_offsets,
+            inverse_norm,
+            mask=first_dictionary_tile & row_mask,
+        )
+
+
+    @triton.jit
+    def _dictionary_route_forward_fused_kernel(
+        input_ptr,
+        dictionary_key_ptr,
+        dictionary_value_ptr,
+        beta_ptr,
+        normalized_ptr,
+        input_inverse_norm_ptr,
+        logits_ptr,
+        weights_ptr,
+        output_ptr,
+        output_inverse_norm_ptr,
+        input_row_stride,
+        dictionary_key_row_stride,
+        dictionary_value_row_stride,
+        normalized_row_stride,
+        logits_row_stride,
+        weights_row_stride,
+        output_row_stride,
+        rows,
+        routing_dim: tl.constexpr,
+        eps: tl.constexpr,
+        IS_BF16: tl.constexpr,
+        BLOCK_R: tl.constexpr,
+        BLOCK_ROWS: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        BLOCK_ATOMS: tl.constexpr,
+        DICTIONARY_SIZE: tl.constexpr,
+    ):
+        row_offsets = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+        routing_offsets = tl.arange(0, BLOCK_R)
+        atom_offsets = tl.arange(0, DICTIONARY_SIZE)
+        row_mask = row_offsets < rows
+        routing_mask = routing_offsets < routing_dim
+
+        values = tl.load(
+            input_ptr
+            + row_offsets[:, None] * input_row_stride
+            + routing_offsets[None, :],
+            mask=row_mask[:, None] & routing_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        input_inverse_norm = tl.rsqrt(tl.sum(values * values, axis=1) + eps)
+        normalized = values * input_inverse_norm[:, None]
+        tl.store(
+            normalized_ptr
+            + row_offsets[:, None] * normalized_row_stride
+            + routing_offsets[None, :],
+            normalized,
+            mask=row_mask[:, None] & routing_mask[None, :],
+        )
+        tl.store(
+            input_inverse_norm_ptr + row_offsets,
+            input_inverse_norm,
+            mask=row_mask,
+        )
+
+        logits = tl.zeros((BLOCK_ROWS, DICTIONARY_SIZE), tl.float32)
+        for routing_start in tl.static_range(0, BLOCK_R, BLOCK_K):
+            routing_tile = routing_start + tl.arange(0, BLOCK_K)
+            input_tile = tl.load(
+                input_ptr
+                + row_offsets[:, None] * input_row_stride
+                + routing_tile[None, :],
+                mask=row_mask[:, None] & (routing_tile[None, :] < routing_dim),
+                other=0.0,
+            ).to(tl.float32)
+            input_tile = input_tile * input_inverse_norm[:, None]
+            if IS_BF16:
+                input_tile_for_dot = input_tile.to(tl.bfloat16)
+            else:
+                input_tile_for_dot = input_tile.to(tl.float16)
+            dictionary_key = tl.load(
+                dictionary_key_ptr
+                + routing_tile[:, None] * dictionary_key_row_stride
+                + atom_offsets[None, :],
+                mask=(routing_tile[:, None] < routing_dim),
+                other=0.0,
+            )
+            logits += tl.dot(input_tile_for_dot, dictionary_key)
+
+        beta = tl.load(beta_ptr).to(tl.float32)
+        scaled_logits = logits * beta
+        scaled_logits = scaled_logits - tl.max(scaled_logits, axis=1)[:, None]
+        numerators = tl.exp(scaled_logits)
+        weights = numerators / tl.sum(numerators, axis=1)[:, None]
+        tl.store(
+            logits_ptr
+            + row_offsets[:, None] * logits_row_stride
+            + atom_offsets[None, :],
+            logits,
+            mask=row_mask[:, None],
+        )
+        tl.store(
+            weights_ptr
+            + row_offsets[:, None] * weights_row_stride
+            + atom_offsets[None, :],
+            weights,
+            mask=row_mask[:, None],
+        )
+
+        # The weights are required by backward anyway. Store them once, then
+        # tile the reconstruction read so Dv never occupies one giant block.
+        tl.debug_barrier()
+        reconstructed = tl.zeros((BLOCK_ROWS, BLOCK_R), tl.float32)
+        for atom_start in tl.static_range(0, DICTIONARY_SIZE, BLOCK_ATOMS):
+            atom_tile = atom_start + tl.arange(0, BLOCK_ATOMS)
+            weight_tile = tl.load(
+                weights_ptr
+                + row_offsets[:, None] * weights_row_stride
+                + atom_tile[None, :],
+                mask=row_mask[:, None],
+                other=0.0,
+            )
+            dictionary_value = tl.load(
+                dictionary_value_ptr
+                + routing_offsets[:, None] * dictionary_value_row_stride
+                + atom_tile[None, :],
+                mask=routing_mask[:, None],
+                other=0.0,
+            )
+            if IS_BF16:
+                weight_tile_for_dot = weight_tile.to(tl.bfloat16)
+            else:
+                weight_tile_for_dot = weight_tile.to(tl.float16)
+            reconstructed += tl.dot(weight_tile_for_dot, dictionary_value.T)
+
+        output_inverse_norm = tl.rsqrt(
+            tl.sum(reconstructed * reconstructed, axis=1) + eps
+        )
+        output = reconstructed * output_inverse_norm[:, None]
+        tl.store(
+            output_ptr
+            + row_offsets[:, None] * output_row_stride
+            + routing_offsets[None, :],
+            output,
+            mask=row_mask[:, None] & routing_mask[None, :],
+        )
+        tl.store(
+            output_inverse_norm_ptr + row_offsets,
+            output_inverse_norm,
+            mask=row_mask,
+        )
+
+
+    @triton.jit
+    def _dictionary_route_backward_fused_kernel(
+        normalized_ptr,
+        input_inverse_norm_ptr,
+        logits_ptr,
+        weights_ptr,
+        output_ptr,
+        output_inverse_norm_ptr,
+        grad_output_ptr,
+        dictionary_key_ptr,
+        dictionary_value_ptr,
+        beta_ptr,
+        grad_input_ptr,
+        grad_reconstructed_ptr,
+        grad_logits_ptr,
+        grad_beta_rows_ptr,
+        normalized_row_stride,
+        logits_row_stride,
+        weights_row_stride,
+        output_row_stride,
+        grad_output_row_stride,
+        dictionary_key_row_stride,
+        dictionary_value_row_stride,
+        grad_input_row_stride,
+        grad_reconstructed_row_stride,
+        grad_logits_row_stride,
+        rows,
+        routing_dim: tl.constexpr,
+        IS_BF16: tl.constexpr,
+        COMPUTE_BETA_GRAD: tl.constexpr,
+        BLOCK_R: tl.constexpr,
+        BLOCK_ROWS: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        BLOCK_ATOMS: tl.constexpr,
+        DICTIONARY_SIZE: tl.constexpr,
+    ):
+        row_offsets = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+        routing_offsets = tl.arange(0, BLOCK_R)
+        atom_offsets = tl.arange(0, DICTIONARY_SIZE)
+        row_mask = row_offsets < rows
+        routing_mask = routing_offsets < routing_dim
+
+        output = tl.load(
+            output_ptr
+            + row_offsets[:, None] * output_row_stride
+            + routing_offsets[None, :],
+            mask=row_mask[:, None] & routing_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        grad_output = tl.load(
+            grad_output_ptr
+            + row_offsets[:, None] * grad_output_row_stride
+            + routing_offsets[None, :],
+            mask=row_mask[:, None] & routing_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        output_inverse_norm = tl.load(
+            output_inverse_norm_ptr + row_offsets,
+            mask=row_mask,
+            other=0.0,
+        ).to(tl.float32)
+        output_projection = tl.sum(grad_output * output, axis=1)
+        grad_reconstructed = (
+            grad_output - output * output_projection[:, None]
+        ) * output_inverse_norm[:, None]
+        tl.store(
+            grad_reconstructed_ptr
+            + row_offsets[:, None] * grad_reconstructed_row_stride
+            + routing_offsets[None, :],
+            grad_reconstructed,
+            mask=row_mask[:, None] & routing_mask[None, :],
+        )
+        tl.debug_barrier()
+
+        grad_weights = tl.zeros((BLOCK_ROWS, DICTIONARY_SIZE), tl.float32)
+        for routing_start in tl.static_range(0, BLOCK_R, BLOCK_K):
+            routing_tile = routing_start + tl.arange(0, BLOCK_K)
+            grad_reconstructed_tile = tl.load(
+                grad_reconstructed_ptr
+                + row_offsets[:, None] * grad_reconstructed_row_stride
+                + routing_tile[None, :],
+                mask=row_mask[:, None] & (routing_tile[None, :] < routing_dim),
+                other=0.0,
+            )
+            dictionary_value = tl.load(
+                dictionary_value_ptr
+                + routing_tile[:, None] * dictionary_value_row_stride
+                + atom_offsets[None, :],
+                mask=(routing_tile[:, None] < routing_dim),
+                other=0.0,
+            )
+            if IS_BF16:
+                grad_reconstructed_for_dot = grad_reconstructed_tile.to(tl.bfloat16)
+            else:
+                grad_reconstructed_for_dot = grad_reconstructed_tile.to(tl.float16)
+            grad_weights += tl.dot(grad_reconstructed_for_dot, dictionary_value)
+
+        weights = tl.load(
+            weights_ptr
+            + row_offsets[:, None] * weights_row_stride
+            + atom_offsets[None, :],
+            mask=row_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        centered = grad_weights - tl.sum(grad_weights * weights, axis=1)[:, None]
+        grad_scaled_logits = weights * centered
+        beta = tl.load(beta_ptr).to(tl.float32)
+        grad_logits = grad_scaled_logits * beta
+        tl.store(
+            grad_logits_ptr
+            + row_offsets[:, None] * grad_logits_row_stride
+            + atom_offsets[None, :],
+            grad_logits,
+            mask=row_mask[:, None],
+        )
+        if COMPUTE_BETA_GRAD:
+            logits = tl.load(
+                logits_ptr
+                + row_offsets[:, None] * logits_row_stride
+                + atom_offsets[None, :],
+                mask=row_mask[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            tl.store(
+                grad_beta_rows_ptr + row_offsets,
+                tl.sum(grad_scaled_logits * logits, axis=1),
+                mask=row_mask,
+            )
+
+        tl.debug_barrier()
+        grad_normalized = tl.zeros((BLOCK_ROWS, BLOCK_R), tl.float32)
+        for atom_start in tl.static_range(0, DICTIONARY_SIZE, BLOCK_ATOMS):
+            atom_tile = atom_start + tl.arange(0, BLOCK_ATOMS)
+            grad_logits_tile = tl.load(
+                grad_logits_ptr
+                + row_offsets[:, None] * grad_logits_row_stride
+                + atom_tile[None, :],
+                mask=row_mask[:, None],
+                other=0.0,
+            )
+            dictionary_key = tl.load(
+                dictionary_key_ptr
+                + routing_offsets[:, None] * dictionary_key_row_stride
+                + atom_tile[None, :],
+                mask=routing_mask[:, None],
+                other=0.0,
+            )
+            if IS_BF16:
+                grad_logits_for_dot = grad_logits_tile.to(tl.bfloat16)
+            else:
+                grad_logits_for_dot = grad_logits_tile.to(tl.float16)
+            grad_normalized += tl.dot(grad_logits_for_dot, dictionary_key.T)
+
+        normalized = tl.load(
+            normalized_ptr
+            + row_offsets[:, None] * normalized_row_stride
+            + routing_offsets[None, :],
+            mask=row_mask[:, None] & routing_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        input_inverse_norm = tl.load(
+            input_inverse_norm_ptr + row_offsets,
+            mask=row_mask,
+            other=0.0,
+        ).to(tl.float32)
+        input_projection = tl.sum(grad_normalized * normalized, axis=1)
+        grad_input = (
+            grad_normalized - normalized * input_projection[:, None]
+        ) * input_inverse_norm[:, None]
+        tl.store(
+            grad_input_ptr
+            + row_offsets[:, None] * grad_input_row_stride
+            + routing_offsets[None, :],
+            grad_input,
+            mask=row_mask[:, None] & routing_mask[None, :],
+        )
 
 
     @triton.jit
@@ -65,21 +473,21 @@ if TRITON_AVAILABLE:
 
     @triton.jit
     def _row_l2_normalize_backward_kernel(
-        input_ptr,
+        normalized_ptr,
+        inverse_norm_ptr,
         grad_output_ptr,
         grad_input_ptr,
-        input_row_stride,
+        normalized_row_stride,
         grad_output_row_stride,
         grad_input_row_stride,
         n_cols: tl.constexpr,
-        eps: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
         row = tl.program_id(0)
         columns = tl.arange(0, BLOCK)
         mask = columns < n_cols
-        values = tl.load(
-            input_ptr + row * input_row_stride + columns,
+        normalized = tl.load(
+            normalized_ptr + row * normalized_row_stride + columns,
             mask=mask,
             other=0.0,
         ).to(tl.float32)
@@ -88,10 +496,11 @@ if TRITON_AVAILABLE:
             mask=mask,
             other=0.0,
         ).to(tl.float32)
-        inverse_norm = tl.rsqrt(tl.sum(values * values, axis=0) + eps)
-        projection = tl.sum(grad_output * values, axis=0)
-        inverse_norm_cubed = inverse_norm * inverse_norm * inverse_norm
-        grad_input = grad_output * inverse_norm - values * projection * inverse_norm_cubed
+        inverse_norm = tl.load(inverse_norm_ptr + row).to(tl.float32)
+        # For y = x / ||x||, dx = (dy - y <dy, y>) / ||x||.  Reusing y and
+        # the forward inverse norm removes the second reduction over x * x.
+        projection = tl.sum(grad_output * normalized, axis=0)
+        grad_input = (grad_output - normalized * projection) * inverse_norm
         tl.store(
             grad_input_ptr + row * grad_input_row_stride + columns,
             grad_input,
@@ -112,6 +521,7 @@ if TRITON_AVAILABLE:
         grad_weights_row_stride,
         grad_logits_row_stride,
         n_cols: tl.constexpr,
+        COMPUTE_BETA_GRAD: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
         row = tl.program_id(0)
@@ -140,10 +550,11 @@ if TRITON_AVAILABLE:
             beta * grad_scaled_logits,
             mask=mask,
         )
-        tl.store(
-            grad_beta_ptr + row,
-            tl.sum(grad_scaled_logits * logits, axis=0),
-        )
+        if COMPUTE_BETA_GRAD:
+            tl.store(
+                grad_beta_ptr + row,
+                tl.sum(grad_scaled_logits * logits, axis=0),
+            )
 
 
     @triton.jit
@@ -758,7 +1169,7 @@ def _require_triton() -> None:
         raise RuntimeError("Triton is not installed; use backend='torch' or backend='auto'")
 
 
-def _row_l2_normalize(input: Tensor, eps: float) -> Tensor:
+def _row_l2_normalize(input: Tensor, eps: float) -> tuple[Tensor, Tensor]:
     _require_triton()
     if input.ndim != 2 or not input.is_cuda:
         raise ValueError("Triton row normalization expects a CUDA matrix")
@@ -766,11 +1177,13 @@ def _row_l2_normalize(input: Tensor, eps: float) -> Tensor:
     if columns > 4096:
         raise ValueError("Triton row normalization currently supports at most 4096 columns")
     output = torch.empty_like(input)
+    inverse_norm = torch.empty(rows, dtype=torch.float32, device=input.device)
     block = triton.next_power_of_2(columns)
     warps = 8 if block >= 2048 else 4
     _row_l2_normalize_kernel[(rows,)](
         input,
         output,
+        inverse_norm,
         input.stride(0),
         output.stride(0),
         n_cols=columns,
@@ -778,7 +1191,72 @@ def _row_l2_normalize(input: Tensor, eps: float) -> Tensor:
         BLOCK=block,
         num_warps=warps,
     )
-    return output
+    return output, inverse_norm
+
+
+def _normalized_assignment(
+    input: Tensor,
+    dictionary_key: Tensor,
+    eps: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    _require_triton()
+    input = input.contiguous()
+    dictionary_key = dictionary_key.contiguous()
+    if (
+        input.ndim != 2
+        or dictionary_key.ndim != 2
+        or input.shape[1] != dictionary_key.shape[0]
+        or not input.is_cuda
+        or not dictionary_key.is_cuda
+        or input.dtype != dictionary_key.dtype
+        or input.dtype not in {torch.float16, torch.bfloat16}
+    ):
+        raise ValueError(
+            "fused dictionary assignment expects matching CUDA fp16/bf16 matrices"
+        )
+    rows, routing_dim = input.shape
+    dictionary_size = dictionary_key.shape[1]
+    if routing_dim > 512 or dictionary_size > 4096:
+        raise ValueError(
+            "fused dictionary assignment supports routing widths up to 512 "
+            "and dictionaries up to 4096 atoms"
+        )
+    normalized = torch.empty_like(input)
+    inverse_norm = torch.empty(rows, dtype=torch.float32, device=input.device)
+    logits = torch.empty(
+        (rows, dictionary_size),
+        dtype=input.dtype,
+        device=input.device,
+    )
+    block_r = max(16, triton.next_power_of_2(routing_dim))
+    block_rows = 32
+    block_dictionary = 64
+    grid = (
+        triton.cdiv(rows, block_rows),
+        triton.cdiv(dictionary_size, block_dictionary),
+    )
+    _normalized_assignment_kernel[grid](
+        input,
+        dictionary_key,
+        normalized,
+        inverse_norm,
+        logits,
+        input.stride(0),
+        dictionary_key.stride(0),
+        normalized.stride(0),
+        logits.stride(0),
+        rows,
+        routing_dim=routing_dim,
+        dictionary_size=dictionary_size,
+        eps=eps,
+        IS_BF16=input.dtype == torch.bfloat16,
+        BLOCK_R=block_r,
+        BLOCK_ROWS=block_rows,
+        BLOCK_DICTIONARY=block_dictionary,
+        num_warps=8,
+        num_stages=2,
+    )
+    return normalized, inverse_norm, logits
 
 
 def _row_scaled_softmax(input: Tensor, beta: Tensor) -> Tensor:
@@ -804,27 +1282,37 @@ def _row_scaled_softmax(input: Tensor, beta: Tensor) -> Tensor:
     return output
 
 
-def _row_l2_normalize_backward(input: Tensor, grad_output: Tensor, eps: float) -> Tensor:
+def _row_l2_normalize_backward(
+    normalized: Tensor,
+    inverse_norm: Tensor,
+    grad_output: Tensor,
+) -> Tensor:
     _require_triton()
-    input = input.contiguous()
+    normalized = normalized.contiguous()
+    inverse_norm = inverse_norm.contiguous()
     grad_output = grad_output.contiguous()
-    if input.ndim != 2 or input.shape != grad_output.shape or not input.is_cuda:
+    if (
+        normalized.ndim != 2
+        or normalized.shape != grad_output.shape
+        or inverse_norm.shape != (normalized.shape[0],)
+        or not normalized.is_cuda
+    ):
         raise ValueError("Triton row normalization backward expects matching CUDA matrices")
-    rows, columns = input.shape
+    rows, columns = normalized.shape
     if columns > 4096:
         raise ValueError("Triton row normalization backward supports at most 4096 columns")
-    grad_input = torch.empty_like(input)
+    grad_input = torch.empty_like(normalized)
     block = triton.next_power_of_2(columns)
     warps = 8 if block >= 2048 else 4
     _row_l2_normalize_backward_kernel[(rows,)](
-        input,
+        normalized,
+        inverse_norm,
         grad_output,
         grad_input,
-        input.stride(0),
+        normalized.stride(0),
         grad_output.stride(0),
         grad_input.stride(0),
         n_cols=columns,
-        eps=eps,
         BLOCK=block,
         num_warps=warps,
     )
@@ -836,7 +1324,8 @@ def _row_scaled_softmax_backward(
     weights: Tensor,
     grad_weights: Tensor,
     beta: Tensor,
-) -> tuple[Tensor, Tensor]:
+    compute_beta_grad: bool,
+) -> tuple[Tensor, Tensor | None]:
     _require_triton()
     logits = logits.contiguous()
     weights = weights.contiguous()
@@ -852,7 +1341,11 @@ def _row_scaled_softmax_backward(
     if columns > 4096:
         raise ValueError("Triton softmax backward supports at most 4096 columns")
     grad_logits = torch.empty_like(logits)
-    grad_beta_rows = torch.empty(rows, dtype=torch.float32, device=logits.device)
+    grad_beta_rows = (
+        torch.empty(rows, dtype=torch.float32, device=logits.device)
+        if compute_beta_grad
+        else logits
+    )
     block = triton.next_power_of_2(columns)
     warps = 8 if block >= 2048 else 4
     _row_scaled_softmax_backward_kernel[(rows,)](
@@ -867,10 +1360,203 @@ def _row_scaled_softmax_backward(
         grad_weights.stride(0),
         grad_logits.stride(0),
         n_cols=columns,
+        COMPUTE_BETA_GRAD=compute_beta_grad,
         BLOCK=block,
         num_warps=warps,
     )
-    return grad_logits, grad_beta_rows.sum().to(beta.dtype)
+    grad_beta = grad_beta_rows.sum().to(beta.dtype) if compute_beta_grad else None
+    return grad_logits, grad_beta
+
+
+def _dictionary_route_fused_forward(
+    input: Tensor,
+    dictionary_key: Tensor,
+    dictionary_value: Tensor,
+    beta: Tensor,
+    eps: float,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    _require_triton()
+    original_shape = input.shape
+    flat = input.contiguous().view(-1, original_shape[-1])
+    dictionary_key = dictionary_key.contiguous()
+    dictionary_value = dictionary_value.contiguous()
+    beta = beta.contiguous()
+    rows, routing_dim = flat.shape
+    if (
+        routing_dim not in {128, 256}
+        or dictionary_key.shape != (routing_dim, 512)
+        or dictionary_value.shape != dictionary_key.shape
+        or flat.dtype not in {torch.float16, torch.bfloat16}
+        or dictionary_key.dtype != flat.dtype
+        or dictionary_value.dtype != flat.dtype
+        or not all(tensor.is_cuda for tensor in (flat, dictionary_key, dictionary_value, beta))
+    ):
+        raise ValueError(
+            "fully fused dictionary route expects CUDA fp16/bf16 tensors with "
+            "routing width 128 or 256 and 512 dictionary atoms"
+        )
+    normalized = torch.empty_like(flat)
+    input_inverse_norm = torch.empty(rows, dtype=torch.float32, device=flat.device)
+    logits = torch.empty((rows, 512), dtype=flat.dtype, device=flat.device)
+    weights = torch.empty_like(logits)
+    output = torch.empty_like(flat)
+    output_inverse_norm = torch.empty(rows, dtype=torch.float32, device=flat.device)
+    block_r = triton.next_power_of_2(routing_dim)
+    block_rows = 16
+    _dictionary_route_forward_fused_kernel[(triton.cdiv(rows, block_rows),)](
+        flat,
+        dictionary_key,
+        dictionary_value,
+        beta,
+        normalized,
+        input_inverse_norm,
+        logits,
+        weights,
+        output,
+        output_inverse_norm,
+        flat.stride(0),
+        dictionary_key.stride(0),
+        dictionary_value.stride(0),
+        normalized.stride(0),
+        logits.stride(0),
+        weights.stride(0),
+        output.stride(0),
+        rows,
+        routing_dim=routing_dim,
+        eps=eps,
+        IS_BF16=flat.dtype == torch.bfloat16,
+        BLOCK_R=block_r,
+        BLOCK_ROWS=block_rows,
+        BLOCK_K=32,
+        BLOCK_ATOMS=64,
+        DICTIONARY_SIZE=512,
+        num_warps=8,
+        num_stages=2,
+    )
+    return (
+        output.view(original_shape),
+        normalized,
+        input_inverse_norm,
+        logits,
+        weights,
+        output_inverse_norm,
+    )
+
+
+def _can_use_fused_dictionary_route(
+    input: Tensor,
+    dictionary_key: Tensor,
+    dictionary_value: Tensor,
+) -> bool:
+    if not FUSED_DICTIONARY_ROUTE or not input.is_cuda:
+        return False
+    route_rows = input.numel() // input.shape[-1]
+    return (
+        route_rows <= FUSED_DICTIONARY_ROUTE_MAX_ROWS
+        and input.shape[-1] in {128, 256}
+        and dictionary_key.shape == (input.shape[-1], 512)
+        and dictionary_value.shape == dictionary_key.shape
+        and input.dtype in {torch.float16, torch.bfloat16}
+        and dictionary_key.dtype == input.dtype
+        and dictionary_value.dtype == input.dtype
+        and dictionary_key.is_cuda
+        and dictionary_value.is_cuda
+        and torch.cuda.get_device_capability(input.device)[0] >= 12
+    )
+
+
+def _dictionary_route_fused_backward(
+    dictionary_key: Tensor,
+    dictionary_value: Tensor,
+    beta: Tensor,
+    output: Tensor,
+    normalized: Tensor,
+    input_inverse_norm: Tensor,
+    logits: Tensor,
+    weights: Tensor,
+    output_inverse_norm: Tensor,
+    grad_output: Tensor,
+    input_shape: torch.Size,
+    compute_beta_grad: bool,
+) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
+    _require_triton()
+    dictionary_key = dictionary_key.contiguous()
+    dictionary_value = dictionary_value.contiguous()
+    beta = beta.contiguous()
+    output = output.contiguous().view(-1, output.shape[-1])
+    normalized = normalized.contiguous()
+    input_inverse_norm = input_inverse_norm.contiguous()
+    logits = logits.contiguous()
+    weights = weights.contiguous()
+    output_inverse_norm = output_inverse_norm.contiguous()
+    grad_output = grad_output.contiguous().view(-1, grad_output.shape[-1])
+    rows, routing_dim = normalized.shape
+    if (
+        output.shape != normalized.shape
+        or grad_output.shape != normalized.shape
+        or logits.shape != (rows, 512)
+        or weights.shape != logits.shape
+        or dictionary_key.shape != (routing_dim, 512)
+        or dictionary_value.shape != dictionary_key.shape
+    ):
+        raise ValueError("invalid tensors for fully fused dictionary route backward")
+
+    grad_input = torch.empty_like(normalized)
+    grad_reconstructed = torch.empty_like(normalized)
+    grad_logits = torch.empty_like(logits)
+    grad_beta_rows = (
+        torch.empty(rows, dtype=torch.float32, device=logits.device)
+        if compute_beta_grad
+        else logits
+    )
+    block_r = triton.next_power_of_2(routing_dim)
+    block_rows = 16
+    _dictionary_route_backward_fused_kernel[(triton.cdiv(rows, block_rows),)](
+        normalized,
+        input_inverse_norm,
+        logits,
+        weights,
+        output,
+        output_inverse_norm,
+        grad_output,
+        dictionary_key,
+        dictionary_value,
+        beta,
+        grad_input,
+        grad_reconstructed,
+        grad_logits,
+        grad_beta_rows,
+        normalized.stride(0),
+        logits.stride(0),
+        weights.stride(0),
+        output.stride(0),
+        grad_output.stride(0),
+        dictionary_key.stride(0),
+        dictionary_value.stride(0),
+        grad_input.stride(0),
+        grad_reconstructed.stride(0),
+        grad_logits.stride(0),
+        rows,
+        routing_dim=routing_dim,
+        IS_BF16=normalized.dtype == torch.bfloat16,
+        COMPUTE_BETA_GRAD=compute_beta_grad,
+        BLOCK_R=block_r,
+        BLOCK_ROWS=block_rows,
+        BLOCK_K=32,
+        BLOCK_ATOMS=64,
+        DICTIONARY_SIZE=512,
+        num_warps=8,
+        num_stages=2,
+    )
+    grad_dictionary_value = grad_reconstructed.transpose(0, 1) @ weights
+    grad_dictionary_key = normalized.transpose(0, 1) @ grad_logits
+    grad_beta = grad_beta_rows.sum().to(beta.dtype) if compute_beta_grad else None
+    return (
+        grad_input.view(input_shape),
+        grad_dictionary_key,
+        grad_dictionary_value,
+        grad_beta,
+    )
 
 
 def _dictionary_route_triton_forward(
@@ -879,15 +1565,40 @@ def _dictionary_route_triton_forward(
     dictionary_value: Tensor,
     beta: Tensor,
     eps: float,
-) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    if _can_use_fused_dictionary_route(input, dictionary_key, dictionary_value):
+        return _dictionary_route_fused_forward(
+            input, dictionary_key, dictionary_value, beta, eps
+        )
     original_shape = input.shape
     flat = input.contiguous().view(-1, original_shape[-1])
-    normalized = _row_l2_normalize(flat, eps)
-    logits = normalized @ dictionary_key.contiguous()
+    use_fused_assignment = (
+        FUSED_DICTIONARY_ASSIGNMENT
+        and flat.shape[0] <= FUSED_DICTIONARY_ASSIGNMENT_MAX_ROWS
+        and flat.shape[1] == 256
+        and dictionary_key.shape == (256, 512)
+        and flat.dtype in {torch.float16, torch.bfloat16}
+        and dictionary_key.dtype == flat.dtype
+        and torch.cuda.get_device_capability(flat.device)[0] >= 12
+    )
+    if use_fused_assignment:
+        normalized, input_inverse_norm, logits = _normalized_assignment(
+            flat, dictionary_key, eps
+        )
+    else:
+        normalized, input_inverse_norm = _row_l2_normalize(flat, eps)
+        logits = normalized @ dictionary_key.contiguous()
     weights = _row_scaled_softmax(logits, beta)
     reconstructed = weights @ dictionary_value.transpose(0, 1).contiguous()
-    output = _row_l2_normalize(reconstructed, eps)
-    return output.view(original_shape), normalized, logits, weights, reconstructed
+    output, output_inverse_norm = _row_l2_normalize(reconstructed, eps)
+    return (
+        output.view(original_shape),
+        normalized,
+        input_inverse_norm,
+        logits,
+        weights,
+        output_inverse_norm,
+    )
 
 
 class _DictionaryRouteFunction(torch.autograd.Function):
@@ -900,49 +1611,91 @@ class _DictionaryRouteFunction(torch.autograd.Function):
         beta: Tensor,
         eps: float,
     ) -> Tensor:
-        output, normalized, logits, weights, reconstructed = _dictionary_route_triton_forward(
-            input, dictionary_key, dictionary_value, beta, eps
+        ctx.used_fused_route = _can_use_fused_dictionary_route(
+            input, dictionary_key, dictionary_value
         )
+        (
+            output,
+            normalized,
+            input_inverse_norm,
+            logits,
+            weights,
+            output_inverse_norm,
+        ) = _dictionary_route_triton_forward(input, dictionary_key, dictionary_value, beta, eps)
         ctx.save_for_backward(
-            input,
             dictionary_key,
             dictionary_value,
             beta,
+            output,
             normalized,
+            input_inverse_norm,
             logits,
             weights,
-            reconstructed,
+            output_inverse_norm,
         )
-        ctx.eps = eps
+        ctx.input_shape = input.shape
         return output
 
     @staticmethod
     def backward(ctx: torch.autograd.function.FunctionCtx, grad_output: Tensor):
         (
-            input,
             dictionary_key,
             dictionary_value,
             beta,
+            output,
             normalized,
+            input_inverse_norm,
             logits,
             weights,
-            reconstructed,
+            output_inverse_norm,
         ) = ctx.saved_tensors
-        flat_input = input.contiguous().view(-1, input.shape[-1])
+        fused_backward_rows = normalized.shape[0]
+        use_fused_backward = (
+            ctx.used_fused_route
+            and FUSED_DICTIONARY_ROUTE_BACKWARD
+            and (
+                normalized.shape[1] == 128
+                or fused_backward_rows <= FUSED_DICTIONARY_ROUTE_BACKWARD_MAX_ROWS_R256
+            )
+        )
+        if use_fused_backward:
+            grad_input, grad_dictionary_key, grad_dictionary_value, grad_beta = (
+                _dictionary_route_fused_backward(
+                    dictionary_key,
+                    dictionary_value,
+                    beta,
+                    output,
+                    normalized,
+                    input_inverse_norm,
+                    logits,
+                    weights,
+                    output_inverse_norm,
+                    grad_output,
+                    ctx.input_shape,
+                    ctx.needs_input_grad[3],
+                )
+            )
+            return (
+                grad_input,
+                grad_dictionary_key,
+                grad_dictionary_value,
+                grad_beta,
+                None,
+            )
         flat_grad_output = grad_output.contiguous().view(-1, grad_output.shape[-1])
         grad_reconstructed = _row_l2_normalize_backward(
-            reconstructed, flat_grad_output, ctx.eps
+            output.view(-1, output.shape[-1]), output_inverse_norm, flat_grad_output
         )
         grad_weights = grad_reconstructed @ dictionary_value.contiguous()
         grad_dictionary_value = grad_reconstructed.transpose(0, 1) @ weights
         grad_logits, grad_beta = _row_scaled_softmax_backward(
-            logits, weights, grad_weights, beta
+            logits, weights, grad_weights, beta, ctx.needs_input_grad[3]
         )
         grad_normalized = grad_logits @ dictionary_key.transpose(0, 1).contiguous()
         grad_dictionary_key = normalized.transpose(0, 1) @ grad_logits
         grad_input = _row_l2_normalize_backward(
-            flat_input, grad_normalized, ctx.eps
-        ).view_as(input)
+            normalized, input_inverse_norm, grad_normalized
+        ).view(ctx.input_shape)
         return grad_input, grad_dictionary_key, grad_dictionary_value, grad_beta, None
 
 
@@ -955,9 +1708,10 @@ def dictionary_route_triton(
 ) -> Tensor:
     """Triton forward and backward for the dictionary feature map.
 
-    GEMMs remain with PyTorch/cuBLAS; Triton implements row normalization and
-    temperature-scaled softmax in both directions without autograd graph
-    recomputation.
+    Standard RTX 50-series shapes use fused row-wise forward/backward kernels,
+    leaving only dictionary-parameter gradient reductions with PyTorch/cuBLAS.
+    Other supported shapes use the multi-kernel path. Neither path builds a
+    PyTorch autograd graph for the row-wise operations.
     """
 
     return _DictionaryRouteFunction.apply(input, dictionary_key, dictionary_value, beta, eps)

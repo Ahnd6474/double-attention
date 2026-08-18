@@ -1,4 +1,5 @@
 __pycache__/
+.venv/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
@@ -13,3 +14,4 @@ runs/**/*.tmp
 runs/**/*.log
 runs/multicorpus_variable_vocab_pilot/
 runs/confirmation_v2_smoke/
+runs/smoke/

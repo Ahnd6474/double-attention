@@ -7,13 +7,27 @@ name = "double-attention"
 version = "0.1.0"
 description = "Experimental shared-dictionary low-dimensional attention modules and Triton kernels"
 readme = "README.md"
-requires-python = ">=3.10"
-dependencies = ["torch>=2.2"]
+requires-python = ">=3.10,<3.13"
+dependencies = [
+  "numpy>=2,<3",
+  "torch>=2.12,<2.13",
+]
 
 [project.optional-dependencies]
 data = ["pyarrow>=17", "sentencepiece>=0.2"]
-gpu = ["triton>=3.0; platform_system != 'Windows'"]
+gpu = [
+  "triton>=3.7,<3.8; platform_system != 'Windows'",
+  "triton-windows>=3.7,<3.8; platform_system == 'Windows'",
+]
 test = ["pytest>=8"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
 
 [tool.setuptools.packages.find]
 where = ["src"]

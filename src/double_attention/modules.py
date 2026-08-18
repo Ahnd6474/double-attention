@@ -19,6 +19,9 @@ from .ops import (
 from .triton_kernels import dictionary_route_triton, routed_attention_triton
 
 
+FUSED_QUERY_KEY_PROJECTION = True
+
+
 class SharedDictionaryBank(nn.Module):
     """Globally or stage-wise shared routing dictionary.
 
@@ -131,8 +134,27 @@ class SharedDictionaryAttention(nn.Module):
     def _project_branches(self, projection: nn.Linear, x: Tensor) -> Tensor:
         batch, length, _ = x.shape
         result = projection(x)
+        return self._reshape_branches(result, batch, length)
+
+    def _reshape_branches(self, result: Tensor, batch: int, length: int) -> Tensor:
         result = result.view(batch, length, self.config.qk_branches, self.config.routing_dim)
         return result.permute(0, 2, 1, 3).contiguous()
+
+    def _project_query_key(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        if not FUSED_QUERY_KEY_PROJECTION:
+            return (
+                self._project_branches(self.query, x),
+                self._project_branches(self.key, x),
+            )
+        batch, length, _ = x.shape
+        width = self.config.total_qk_width
+        fused_weight = torch.cat((self.query.weight, self.key.weight), dim=0)
+        projected = F.linear(x, fused_weight)
+        projected_query, projected_key = projected.split(width, dim=-1)
+        return (
+            self._reshape_branches(projected_query, batch, length),
+            self._reshape_branches(projected_key, batch, length),
+        )
 
     def _route(self, x: Tensor, dictionary_key: Tensor, dictionary_value: Tensor, backend: str) -> Tensor:
         if backend == "triton":
@@ -156,6 +178,7 @@ class SharedDictionaryAttention(nn.Module):
         x: Tensor,
         *,
         bank: SharedDictionaryBank | None = None,
+        normalized_dictionary: tuple[Tensor, Tensor] | None = None,
         return_aux: bool = False,
     ) -> Tensor | tuple[Tensor, DoubleAttentionAux]:
         if x.ndim != 3 or x.shape[-1] != self.config.model_dim:
@@ -171,10 +194,21 @@ class SharedDictionaryAttention(nn.Module):
         ):
             raise ValueError("dictionary bank dimensions do not match the attention config")
 
-        projected_query = self._project_branches(self.query, x)
-        projected_key = self._project_branches(self.key, x)
+        projected_query, projected_key = self._project_query_key(x)
         dense_value = self.value(x)
-        dictionary_key, dictionary_value = active_bank.normalized(self.config.eps)
+        if normalized_dictionary is None:
+            dictionary_key, dictionary_value = active_bank.normalized(self.config.eps)
+        else:
+            dictionary_key, dictionary_value = normalized_dictionary
+            expected_dictionary_shape = (
+                self.config.routing_dim,
+                self.config.dictionary_size,
+            )
+            if (
+                dictionary_key.shape != expected_dictionary_shape
+                or dictionary_value.shape != expected_dictionary_shape
+            ):
+                raise ValueError("normalized dictionary dimensions do not match attention config")
         # AMP keeps the master dictionary parameters in fp32 while linear
         # projections become fp16/bf16.  Cast the normalized compute views so
         # Triton/cuBLAS receive one dtype; gradients still flow to fp32 masters.
@@ -263,8 +297,18 @@ class DoubleAttentionBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, x: Tensor, bank: SharedDictionaryBank) -> Tensor:
-        x = x + self.attention(self.attention_norm(x), bank=bank)
+    def forward(
+        self,
+        x: Tensor,
+        bank: SharedDictionaryBank,
+        *,
+        normalized_dictionary: tuple[Tensor, Tensor] | None = None,
+    ) -> Tensor:
+        x = x + self.attention(
+            self.attention_norm(x),
+            bank=bank,
+            normalized_dictionary=normalized_dictionary,
+        )
         return x + self.feedforward(self.feedforward_norm(x))
 
 
@@ -308,9 +352,19 @@ class DoubleAttentionStack(nn.Module):
         )
 
     def forward(self, x: Tensor) -> Tensor:
+        # A bank can serve several blocks. Reusing these normalized views lets
+        # autograd accumulate block gradients before one normalization
+        # backward instead of rebuilding the same graph for every block.
+        normalized_dictionaries = tuple(
+            bank.normalized(self.config.eps) for bank in self.banks
+        )
         for index, block in enumerate(self.blocks):
             bank_index = min(index // self.dictionary_group_size, len(self.banks) - 1)
-            x = block(x, self.banks[bank_index])
+            x = block(
+                x,
+                self.banks[bank_index],
+                normalized_dictionary=normalized_dictionaries[bank_index],
+            )
         return x
 
 

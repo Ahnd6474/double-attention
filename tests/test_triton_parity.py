@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import copy
+
 import pytest
 import torch
 
+import double_attention.modules as attention_modules
 import double_attention.triton_kernels as triton_kernels
+from double_attention import DoubleAttentionStack, SharedDictionaryAttention, experiment_config
 from double_attention.ops import dictionary_route_reference, routed_attention_reference
 from double_attention.triton_kernels import (
     TRITON_AVAILABLE,
@@ -16,6 +20,97 @@ pytestmark = pytest.mark.skipif(
     not TRITON_AVAILABLE or not torch.cuda.is_available(),
     reason="Triton CUDA runtime is unavailable",
 )
+
+
+def test_fused_query_key_projection_amp_parity(monkeypatch: pytest.MonkeyPatch) -> None:
+    torch.manual_seed(8)
+    device = torch.device("cuda")
+    module = SharedDictionaryAttention(
+        experiment_config(
+            "qk4-s4",
+            model_dim=64,
+            routing_dim=16,
+            dictionary_size=32,
+            backend="torch",
+        )
+    ).to(device)
+    x = torch.randn(2, 17, 64, device=device, requires_grad=True)
+
+    monkeypatch.setattr(attention_modules, "FUSED_QUERY_KEY_PROJECTION", False)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        separate_query, separate_key = module._project_query_key(x)
+        separate_loss = separate_query.float().square().mean()
+        separate_loss = separate_loss + separate_key.float().square().mean()
+    separate_loss.backward()
+    separate_gradients = (
+        x.grad.clone(),
+        module.query.weight.grad.clone(),
+        module.key.weight.grad.clone(),
+    )
+
+    module.zero_grad(set_to_none=True)
+    x.grad = None
+    monkeypatch.setattr(attention_modules, "FUSED_QUERY_KEY_PROJECTION", True)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        fused_query, fused_key = module._project_query_key(x)
+        fused_loss = fused_query.float().square().mean()
+        fused_loss = fused_loss + fused_key.float().square().mean()
+    fused_loss.backward()
+
+    torch.testing.assert_close(fused_query, separate_query, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(fused_key, separate_key, atol=2e-2, rtol=2e-2)
+    for expected, actual in zip(
+        separate_gradients,
+        (x.grad, module.query.weight.grad, module.key.weight.grad),
+        strict=True,
+    ):
+        assert actual is not None
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_shared_dictionary_normalization_amp_parity() -> None:
+    torch.manual_seed(10)
+    device = torch.device("cuda")
+    config = experiment_config(
+        "qk4-s4",
+        model_dim=64,
+        routing_dim=128,
+        dictionary_size=512,
+        backend="triton",
+    )
+    stack = DoubleAttentionStack(
+        config,
+        num_layers=2,
+        dictionary_group_size=2,
+        feedforward_dim=96,
+    ).to(device)
+    repeated_stack = copy.deepcopy(stack)
+    x = torch.randn(1, 9, 64, device=device, requires_grad=True)
+    repeated_x = x.detach().clone().requires_grad_()
+
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        shared_output = stack(x)
+        repeated_output = repeated_x
+        for block in repeated_stack.blocks:
+            repeated_output = block(repeated_output, repeated_stack.banks[0])
+        shared_loss = shared_output.float().square().mean()
+        repeated_loss = repeated_output.float().square().mean()
+    shared_loss.backward()
+    repeated_loss.backward()
+
+    torch.testing.assert_close(shared_output, repeated_output, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(x.grad, repeated_x.grad, atol=3e-2, rtol=3e-2)
+    for shared_parameter, repeated_parameter in zip(
+        stack.parameters(),
+        repeated_stack.parameters(),
+        strict=True,
+    ):
+        torch.testing.assert_close(
+            shared_parameter.grad,
+            repeated_parameter.grad,
+            atol=3e-2,
+            rtol=3e-2,
+        )
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -42,6 +137,93 @@ def test_dictionary_route_forward_and_backward(dtype: torch.dtype) -> None:
         tensor.grad = None
     expected.backward(gradient)
     for actual_gradient, tensor in zip(actual_gradients, (x, dk, dv, beta), strict=True):
+        torch.testing.assert_close(actual_gradient, tensor.grad, atol=3e-2, rtol=3e-2)
+
+
+def test_dictionary_route_fixed_beta_backward() -> None:
+    torch.manual_seed(6)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    x = torch.randn(2, 2, 19, 64, device=device, dtype=dtype, requires_grad=True)
+    dk = torch.nn.functional.normalize(
+        torch.randn(64, 128, device=device, dtype=dtype), dim=0
+    ).requires_grad_()
+    dv = torch.nn.functional.normalize(
+        torch.randn(64, 128, device=device, dtype=dtype), dim=0
+    ).requires_grad_()
+    beta = torch.tensor(4.0, device=device)
+
+    expected = dictionary_route_reference(x, dk, dv, beta)
+    actual = dictionary_route_triton(x, dk, dv, beta)
+    gradient = torch.randn_like(actual)
+    actual.backward(gradient, retain_graph=True)
+    actual_gradients = (x.grad.clone(), dk.grad.clone(), dv.grad.clone())
+    for tensor in (x, dk, dv):
+        tensor.grad = None
+    expected.backward(gradient)
+    for actual_gradient, tensor in zip(actual_gradients, (x, dk, dv), strict=True):
+        torch.testing.assert_close(actual_gradient, tensor.grad, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fused_normalized_assignment_matches_cublas(dtype: torch.dtype) -> None:
+    torch.manual_seed(7)
+    device = torch.device("cuda")
+    x = torch.randn(37, 256, device=device, dtype=dtype)
+    dictionary_key = torch.nn.functional.normalize(
+        torch.randn(256, 512, device=device, dtype=dtype), dim=0
+    )
+
+    expected_normalized, expected_inverse_norm = triton_kernels._row_l2_normalize(
+        x, 1e-6
+    )
+    expected_logits = expected_normalized @ dictionary_key
+    normalized, inverse_norm, logits = triton_kernels._normalized_assignment(
+        x, dictionary_key, 1e-6
+    )
+
+    torch.testing.assert_close(normalized, expected_normalized, atol=3e-3, rtol=3e-3)
+    torch.testing.assert_close(inverse_norm, expected_inverse_norm, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(logits, expected_logits, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("routing_dim", [128, 256])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fully_fused_dictionary_route_forward_backward(
+    dtype: torch.dtype,
+    routing_dim: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(triton_kernels, "FUSED_DICTIONARY_ROUTE", True)
+    monkeypatch.setattr(triton_kernels, "FUSED_DICTIONARY_ROUTE_BACKWARD", True)
+    torch.manual_seed(9 + routing_dim)
+    device = torch.device("cuda")
+    x = torch.randn(1, 2, 9, routing_dim, device=device, dtype=dtype, requires_grad=True)
+    dictionary_key = torch.nn.functional.normalize(
+        torch.randn(routing_dim, 512, device=device, dtype=dtype), dim=0
+    ).requires_grad_()
+    dictionary_value = torch.nn.functional.normalize(
+        torch.randn(routing_dim, 512, device=device, dtype=dtype), dim=0
+    ).requires_grad_()
+    beta = torch.tensor(4.0, device=device, requires_grad=True)
+
+    expected = dictionary_route_reference(x, dictionary_key, dictionary_value, beta)
+    actual = dictionary_route_triton(x, dictionary_key, dictionary_value, beta)
+    torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+
+    gradient = torch.randn_like(actual)
+    actual.backward(gradient, retain_graph=True)
+    actual_gradients = tuple(
+        tensor.grad.clone() for tensor in (x, dictionary_key, dictionary_value, beta)
+    )
+    for tensor in (x, dictionary_key, dictionary_value, beta):
+        tensor.grad = None
+    expected.backward(gradient)
+    for actual_gradient, tensor in zip(
+        actual_gradients,
+        (x, dictionary_key, dictionary_value, beta),
+        strict=True,
+    ):
         torch.testing.assert_close(actual_gradient, tensor.grad, atol=3e-2, rtol=3e-2)
 
 
