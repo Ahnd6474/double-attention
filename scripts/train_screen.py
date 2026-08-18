@@ -24,6 +24,11 @@ VARIANTS = (
     "a1-silu-logitnorm-t1",
     "a1-r512-d512",
     "a1-r512-d1024",
+    "a1-r512-d1536",
+    "a1-r512-d1536-qffn",
+    "a1-r512-d2855-qffn",
+    "a1-d1536",
+    "a1-d1536-qffn",
     "a1-no-softmax",
     "a1-no-softmax-g4",
     "a1-no-qnorm",
@@ -92,7 +97,7 @@ def make_model(
             config=config,
             num_layers=6,
             dictionary_group_size=6,
-            feedforward_dim=1536,
+            feedforward_dim=(config.dictionary_size if config.q_dictionary_feedforward else 1536),
         )
     deterministic_initialize(model, 1000 + seed)
     return model

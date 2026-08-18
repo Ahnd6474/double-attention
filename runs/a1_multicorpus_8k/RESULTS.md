@@ -158,6 +158,75 @@ more diverse corpora. Direct signed coefficients provide substantially faster
 fitting on the repeatedly traversed Shakespeare corpus, but are not a robust
 replacement for softmax under this protocol.
 
+## Q-D dictionary FFN with 1,536 atoms
+
+This experiment expands the A1 dictionary from 512 to 1,536 atoms while
+keeping routing width 256. The control retains the standard learned FFN. The
+Q-D FFN removes its first learned matrix and instead reuses each block's
+attention Q projection and the globally shared normalized dictionary:
+
+```text
+D in R^(256 x 1536)
+h = GELU(D^T Q LN(x))
+FFN_D(x) = W h
+```
+
+The atom count therefore matches the original FFN hidden width exactly. The
+output projection `W` remains layer-specific and is initialized identically to
+the corresponding standard-FFN control.
+
+| corpus | A1 D512 | A1 D1536 control | delta vs. D512 | D1536 Q-D FFN | delta vs. control |
+|---|---:|---:|---:|---:|---:|
+| Python docs | **2.824375** | 2.825811 | +0.001436 | 2.980909 | +0.155098 |
+| WikiText-2 | **3.474998** | 3.477303 | +0.002305 | 3.625663 | +0.148360 |
+| Shakespeare | 4.316602 | 4.311128 | -0.005474 | **4.012219** | -0.298909 |
+| Python code | 3.127668 | **3.121264** | -0.006405 | 3.353262 | +0.231999 |
+| Mean loss | 3.435911 | **3.433876** | -0.002034 | 3.493013 | +0.059137 |
+
+Increasing atom count alone is effectively neutral: its four-corpus mean
+improves by only `0.002034`. Replacing the FFN input matrix with `D^T Q` loses
+on the three larger corpora, with a median paired delta of `+0.151729` versus
+the D1536 control. It improves Shakespeare substantially, but that corpus is
+traversed 10.75 times under the fixed token budget, while the others see less
+than one epoch.
+
+The Q-D model has 10,931,206 parameters, 30.2% fewer than the 15,659,014-
+parameter D1536 control, because six independent 1536-by-512 FFN matrices are
+removed. The Shakespeare result is therefore consistent with capacity-based
+regularization. A parameter-matched low-rank or shared-W1 control is needed
+before attributing that isolated gain to dictionary semantics.
+
+### Full-rank Q-D FFN with 512-wide attention
+
+The follow-up increases routing and attention width to 512 while retaining
+1,536 atoms. Thus `D^T Q` has shape 1536-by-512 and rank up to 512, matching
+the standard FFN's maximum rank. Dictionary beta is scaled to `4 sqrt(2)` and
+the outer score scale to `sqrt(512)`, as in the earlier R512 controls.
+
+| corpus | R256 control | R256 Q-D | Q-D delta | R512 control | R512 Q-D | Q-D delta |
+|---|---:|---:|---:|---:|---:|---:|
+| Python docs | 2.825811 | 2.980909 | +0.155098 | 2.819136 | 2.915682 | +0.096546 |
+| WikiText-2 | 3.477303 | 3.625663 | +0.148360 | 3.475071 | 3.581872 | +0.106801 |
+| Shakespeare | 4.311128 | **4.012219** | -0.298909 | 4.305559 | 4.110526 | -0.195033 |
+| Python code | 3.121264 | 3.353262 | +0.231999 | 3.130014 | 3.264689 | +0.134675 |
+| Mean loss | 3.433876 | 3.493013 | +0.059137 | **3.432445** | 3.468192 | +0.035747 |
+
+Restoring rank improves Q-D loss on Python docs by `0.065227`, WikiText-2 by
+`0.043790`, and Python code by `0.088574`. Averaged across those three larger
+corpora, the deficit to the matching control falls from `0.178486` to
+`0.112674`, a 36.9% recovery. Rank 256 was therefore a material bottleneck,
+but not the full explanation.
+
+The full-rank Q-D model still loses on all three larger corpora. Its fixed
+global `D^T` factor, removal of independent per-layer W1 parameters, and
+attention/FFN gradient coupling remain possible causes. On Shakespeare,
+restoring rank hurts by `0.098307`, consistent with weakening the useful
+capacity regularization on a corpus traversed 10.75 times.
+
+The R512 control has 17,625,094 parameters and the full-rank Q-D model has
+12,897,286. The latter remains 26.8% smaller, so this test isolates algebraic
+rank but does not parameter-match capacity.
+
 ## Broader comparison
 
 QK1-S2 remains best on WikiText-2 at `3.470164`, but its mean delta from A1 is
@@ -175,9 +244,11 @@ produces a corpus-independent win.
 - 4,096,000 training tokens per run;
 - one tied dictionary shared across all six Double Attention layers;
 - NVIDIA GeForce RTX 5060 Laptop GPU;
-- 48 completed runs in the main comparison: MHA4, A1, QK1-S2, A1-SiLU,
+- 64 completed runs in the main comparison: MHA4, A1, QK1-S2, A1-SiLU,
   A1-SiLU-logitnorm, three normalization ablations, and two R512 variants on
   four corpora, plus two direct-SiLU variants without softmax. The later
+  D1536 atom-count and Q-D FFN variants at routing widths 256 and 512 are also
+  included. The later
   `softmax(z)` run was stopped by design and excluded.
 
 This is a one-seed controlled cohort with no held-out test split. Absolute

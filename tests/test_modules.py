@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import double_attention.modules as attention_modules
 from double_attention import (
     DoubleAttentionConfig,
+    DoubleAttentionBlock,
     DoubleAttentionLM,
     DoubleAttentionStack,
     MHA4LM,
@@ -213,7 +214,13 @@ def test_a1_silu_logitnorm_t1_uses_unit_softmax_scale() -> None:
 
 @pytest.mark.parametrize(
     ("name", "dictionary_size"),
-    [("a1-r512-d512", 512), ("a1-r512-d1024", 1024)],
+    [
+        ("a1-r512-d512", 512),
+        ("a1-r512-d1024", 1024),
+        ("a1-r512-d1536", 1536),
+        ("a1-r512-d1536-qffn", 1536),
+        ("a1-r512-d2855-qffn", 2855),
+    ],
 )
 def test_a1_r512_presets_calibrate_temperature(
     name: str, dictionary_size: int
@@ -223,6 +230,67 @@ def test_a1_r512_presets_calibrate_temperature(
     assert config.dictionary_size == dictionary_size
     assert config.beta == pytest.approx(4.0 * (2.0**0.5))
     assert config.initial_score_scale == pytest.approx(512.0**0.5)
+
+
+def test_d1536_presets_keep_routing_width_and_select_q_ffn() -> None:
+    control = experiment_config("a1-d1536")
+    q_ffn = experiment_config("a1-d1536-qffn")
+    full_rank_control = experiment_config("a1-r512-d1536")
+    full_rank_q_ffn = experiment_config("a1-r512-d1536-qffn")
+    matched_q_ffn = experiment_config("a1-r512-d2855-qffn")
+    assert control.routing_dim == q_ffn.routing_dim == 256
+    assert control.dictionary_size == q_ffn.dictionary_size == 1536
+    assert not control.q_dictionary_feedforward
+    assert q_ffn.q_dictionary_feedforward
+    assert full_rank_control.routing_dim == full_rank_q_ffn.routing_dim == 512
+    assert full_rank_control.dictionary_size == full_rank_q_ffn.dictionary_size == 1536
+    assert not full_rank_control.q_dictionary_feedforward
+    assert full_rank_q_ffn.q_dictionary_feedforward
+    assert matched_q_ffn.routing_dim == 512
+    assert matched_q_ffn.dictionary_size == 2855
+    assert matched_q_ffn.q_dictionary_feedforward
+
+
+def test_q_dictionary_ffn_matches_w_gelu_dt_qx_formula() -> None:
+    torch.manual_seed(37)
+    config = experiment_config(
+        "a1-d1536-qffn",
+        model_dim=32,
+        routing_dim=8,
+        dictionary_size=48,
+        backend="torch",
+        untied_dictionary=False,
+    )
+    block = DoubleAttentionBlock(config, feedforward_dim=48)
+    bank = attention_modules.SharedDictionaryBank(8, 48, untied=False)
+    normalized_dictionary = bank.normalized()
+    x = torch.randn(2, 5, 32)
+
+    attention_residual = x + block.attention(
+        block.attention_norm(x),
+        bank=bank,
+        normalized_dictionary=normalized_dictionary,
+    )
+    normalized_x = block.feedforward_norm(attention_residual)
+    query = block.attention.query(normalized_x)
+    hidden = F.linear(query, normalized_dictionary[0].T.contiguous())
+    expected = attention_residual + block.feedforward(hidden)
+    actual = block(x, bank, normalized_dictionary=normalized_dictionary)
+
+    assert isinstance(block.feedforward[0], torch.nn.Identity)
+    assert hidden.shape == (2, 5, 48)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_q_dictionary_ffn_rejects_mismatched_hidden_width() -> None:
+    config = experiment_config(
+        "a1-d1536-qffn",
+        model_dim=32,
+        routing_dim=8,
+        dictionary_size=48,
+    )
+    with pytest.raises(ValueError, match="feedforward_dim == dictionary_size"):
+        DoubleAttentionBlock(config, feedforward_dim=64)
 
 
 @pytest.mark.parametrize(

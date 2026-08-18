@@ -301,15 +301,33 @@ class DoubleAttentionBlock(nn.Module):
     ) -> None:
         super().__init__()
         feedforward_dim = feedforward_dim or 3 * config.model_dim
+        if config.q_dictionary_feedforward:
+            if config.qk_branches != 1:
+                raise ValueError("Q-dictionary FFN requires exactly one Q branch")
+            if feedforward_dim != config.dictionary_size:
+                raise ValueError(
+                    "Q-dictionary FFN requires feedforward_dim == dictionary_size"
+                )
         self.attention_norm = nn.LayerNorm(config.model_dim)
         self.attention = SharedDictionaryAttention(config, create_bank=False)
         self.feedforward_norm = nn.LayerNorm(config.model_dim)
-        self.feedforward = nn.Sequential(
-            nn.Linear(config.model_dim, feedforward_dim),
-            nn.GELU(),
-            nn.Linear(feedforward_dim, config.model_dim),
-            nn.Dropout(dropout),
-        )
+        if config.q_dictionary_feedforward:
+            # Preserve the standard FFN's module indices so its GELU, output
+            # projection, and deterministic initialization remain controlled.
+            # The shared D^T Q expansion replaces only feedforward[0].
+            self.feedforward = nn.Sequential(
+                nn.Identity(),
+                nn.GELU(),
+                nn.Linear(feedforward_dim, config.model_dim),
+                nn.Dropout(dropout),
+            )
+        else:
+            self.feedforward = nn.Sequential(
+                nn.Linear(config.model_dim, feedforward_dim),
+                nn.GELU(),
+                nn.Linear(feedforward_dim, config.model_dim),
+                nn.Dropout(dropout),
+            )
 
     def forward(
         self,
@@ -323,7 +341,19 @@ class DoubleAttentionBlock(nn.Module):
             bank=bank,
             normalized_dictionary=normalized_dictionary,
         )
-        return x + self.feedforward(self.feedforward_norm(x))
+        normalized_x = self.feedforward_norm(x)
+        if not self.attention.config.q_dictionary_feedforward:
+            return x + self.feedforward(normalized_x)
+
+        if normalized_dictionary is None:
+            dictionary_key, _ = bank.normalized(self.attention.config.eps)
+        else:
+            dictionary_key, _ = normalized_dictionary
+        query = self.attention.query(normalized_x)
+        if dictionary_key.dtype != query.dtype:
+            dictionary_key = dictionary_key.to(query.dtype)
+        hidden = F.linear(query, dictionary_key.transpose(0, 1).contiguous())
+        return x + self.feedforward(hidden)
 
 
 class DoubleAttentionStack(nn.Module):

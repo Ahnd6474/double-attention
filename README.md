@@ -38,6 +38,11 @@ project report. Dictionaries can be global or shared by layer groups.
 | `a1-silu-logitnorm-t1` | 1 | 1 | 256 | same post-SiLU standardization with unit final softmax scale: `softmax(z)` |
 | `a1-r512-d512` | 1 | 1 | 512 | remove the Q/K routing bottleneck at fixed dictionary size, with calibrated temperatures |
 | `a1-r512-d1024` | 1 | 1 | 512 | remove the bottleneck while retaining the 2x dictionary expansion ratio |
+| `a1-r512-d1536` | 1 | 1 | 512 | 512-wide attention and 1,536 atoms with the standard learned FFN |
+| `a1-r512-d1536-qffn` | 1 | 1 | 512 | full-rank `W GELU(D^T Q x)` using 512-wide attention |
+| `a1-r512-d2855-qffn` | 1 | 1 | 512 | parameter-matched full-rank Q-D FFN with 2,855 atoms/hidden units |
+| `a1-d1536` | 1 | 1 | 256 | 1,536 dictionary atoms with the standard learned FFN |
+| `a1-d1536-qffn` | 1 | 1 | 256 | reuse attention Q and D as the FFN expansion: `W GELU(D^T Q x)` |
 | `a1-no-softmax` | 1 | 1 | 256 | replace simplex assignment with signed `2 SiLU(D^T q)` dictionary coefficients |
 | `a1-no-softmax-g4` | 1 | 1 | 256 | direct SiLU coefficients with gain 4 and unit slope at the origin |
 | `a1-no-qnorm` | 1 | 1 | 256 | remove Q/K row normalization before dictionary assignment |

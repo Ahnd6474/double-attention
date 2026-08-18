@@ -33,6 +33,7 @@ class DoubleAttentionConfig:
     standardized_logit_scale: float | None = None
     normalize_routing_input: bool = True
     normalize_routing_output: bool = True
+    q_dictionary_feedforward: bool = False
     untied_dictionary: bool = True
     output_projection: bool = True
     value_bias: bool = True
@@ -100,6 +101,11 @@ _PRESETS: dict[
     "a1-silu-logitnorm-t1": (1, 1, 256, "silu", True, 0.25, False, True),
     "a1-r512-d512": (1, 1, 512, "identity", False, None, True, True),
     "a1-r512-d1024": (1, 1, 512, "identity", False, None, True, True),
+    "a1-r512-d1536": (1, 1, 512, "identity", False, None, True, True),
+    "a1-r512-d1536-qffn": (1, 1, 512, "identity", False, None, True, True),
+    "a1-r512-d2855-qffn": (1, 1, 512, "identity", False, None, True, True),
+    "a1-d1536": (1, 1, 256, "identity", False, None, True, True),
+    "a1-d1536-qffn": (1, 1, 256, "identity", False, None, True, True),
     "a1-no-softmax": (1, 1, 256, "identity", False, None, True, True),
     "a1-no-softmax-g4": (1, 1, 256, "identity", False, None, True, True),
     "a1-no-qnorm": (1, 1, 256, "identity", False, None, False, True),
@@ -123,6 +129,28 @@ _PRESET_OVERRIDES: dict[str, dict[str, object]] = {
         "dictionary_size": 1024,
         "beta": 4.0 * (2.0**0.5),
         "initial_score_scale": 512.0**0.5,
+    },
+    "a1-r512-d1536": {
+        "dictionary_size": 1536,
+        "beta": 4.0 * (2.0**0.5),
+        "initial_score_scale": 512.0**0.5,
+    },
+    "a1-r512-d1536-qffn": {
+        "dictionary_size": 1536,
+        "beta": 4.0 * (2.0**0.5),
+        "initial_score_scale": 512.0**0.5,
+        "q_dictionary_feedforward": True,
+    },
+    "a1-r512-d2855-qffn": {
+        "dictionary_size": 2855,
+        "beta": 4.0 * (2.0**0.5),
+        "initial_score_scale": 512.0**0.5,
+        "q_dictionary_feedforward": True,
+    },
+    "a1-d1536": {"dictionary_size": 1536},
+    "a1-d1536-qffn": {
+        "dictionary_size": 1536,
+        "q_dictionary_feedforward": True,
     },
     "a1-no-softmax": {
         "dictionary_assignment": "silu",
