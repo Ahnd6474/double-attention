@@ -1,0 +1,89 @@
+{
+  "variant": "mha4",
+  "dictionary": "none",
+  "corpus": "shakespeare",
+  "vocab_size": 2048,
+  "seed": 0,
+  "parameters": 16838656,
+  "device": "NVIDIA GeForce RTX 5060 Laptop GPU",
+  "amp_dtype": "torch.bfloat16",
+  "micro_batch": 8,
+  "effective_batch": 8,
+  "sequence_length": 64,
+  "training_tokens": 381108,
+  "validation_tokens": 20059,
+  "test_tokens": 0,
+  "start_step": 0,
+  "steps": 8000,
+  "schedule_steps": 12000,
+  "tokens_seen": 4096000,
+  "robust_a": 4.300442188978195,
+  "robust_b": 4.318234708160162,
+  "robust_mean": 4.309338448569179,
+  "perplexity": 74.3912590142354,
+  "history": [
+    {
+      "step": 100,
+      "train_loss": 5.994351387023926,
+      "validation_loss": 6.0618287324905396,
+      "tokens_seen": 51200,
+      "learning_rate": 9.999999999999999e-05,
+      "chunk_seconds": 1.6763577999954578,
+      "max_memory_mib": 366.02392578125
+    },
+    {
+      "step": 500,
+      "train_loss": 4.676560401916504,
+      "validation_loss": 4.946501195430756,
+      "tokens_seen": 256000,
+      "learning_rate": 0.0005,
+      "chunk_seconds": 5.2717577000003075,
+      "max_memory_mib": 366.02392578125
+    },
+    {
+      "step": 1000,
+      "train_loss": 4.378271579742432,
+      "validation_loss": 4.501262664794922,
+      "tokens_seen": 512000,
+      "learning_rate": 0.0005981792031953848,
+      "chunk_seconds": 6.604754500003764,
+      "max_memory_mib": 366.02392578125
+    },
+    {
+      "step": 2000,
+      "train_loss": 3.603731393814087,
+      "validation_loss": 4.282660931348801,
+      "tokens_seen": 1024000,
+      "learning_rate": 0.0005779482201644404,
+      "chunk_seconds": 12.839918199999374,
+      "max_memory_mib": 366.02392578125
+    },
+    {
+      "step": 4000,
+      "train_loss": 3.4001522064208984,
+      "validation_loss": 4.184773847460747,
+      "tokens_seen": 2048000,
+      "learning_rate": 0.000477670575799494,
+      "chunk_seconds": 25.587796299994807,
+      "max_memory_mib": 366.02392578125
+    },
+    {
+      "step": 6000,
+      "train_loss": 2.8553824424743652,
+      "validation_loss": 4.240710958838463,
+      "tokens_seen": 3072000,
+      "learning_rate": 0.0003247738036416997,
+      "chunk_seconds": 26.009243600004993,
+      "max_memory_mib": 366.02392578125
+    },
+    {
+      "step": 8000,
+      "train_loss": 2.2478885650634766,
+      "validation_loss": 4.442175775766373,
+      "tokens_seen": 4096000,
+      "learning_rate": 0.00016453999250673324,
+      "chunk_seconds": 26.2309374999968,
+      "max_memory_mib": 366.02392578125
+    }
+  ]
+}
