@@ -165,6 +165,12 @@ class SharedDictionaryAttention(nn.Module):
                 self.beta,
                 self.config.eps,
                 self.config.dictionary_activation == "silu",
+                self.config.dictionary_assignment == "silu",
+                self.config.dictionary_silu_gain,
+                self.config.standardize_dictionary_logits,
+                self.config.standardized_logit_scale,
+                self.config.normalize_routing_input,
+                self.config.normalize_routing_output,
             )
         return dictionary_route_reference(
             x,
@@ -173,6 +179,12 @@ class SharedDictionaryAttention(nn.Module):
             self.beta,
             self.config.eps,
             self.config.dictionary_activation,
+            self.config.dictionary_assignment,
+            self.config.dictionary_silu_gain,
+            self.config.standardize_dictionary_logits,
+            self.config.standardized_logit_scale,
+            self.config.normalize_routing_input,
+            self.config.normalize_routing_output,
         )
 
     def forward(

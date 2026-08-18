@@ -7,6 +7,7 @@ from typing import Literal
 Backend = Literal["auto", "torch", "triton"]
 MapCombine = Literal["weighted_sum", "concat"]
 DictionaryActivation = Literal["identity", "silu"]
+DictionaryAssignment = Literal["softmax", "silu"]
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,12 @@ class DoubleAttentionConfig:
     initial_score_scale: float = 16.0
     learnable_beta: bool = False
     dictionary_activation: DictionaryActivation = "identity"
+    dictionary_assignment: DictionaryAssignment = "softmax"
+    dictionary_silu_gain: float = 1.0
+    standardize_dictionary_logits: bool = False
+    standardized_logit_scale: float | None = None
+    normalize_routing_input: bool = True
+    normalize_routing_output: bool = True
     untied_dictionary: bool = True
     output_projection: bool = True
     value_bias: bool = True
@@ -43,11 +50,14 @@ class DoubleAttentionConfig:
             "outer_maps": self.outer_maps,
             "beta": self.beta,
             "initial_score_scale": self.initial_score_scale,
+            "dictionary_silu_gain": self.dictionary_silu_gain,
             "eps": self.eps,
         }
         for name, value in positive.items():
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value!r}")
+        if self.standardized_logit_scale is not None and self.standardized_logit_scale <= 0:
+            raise ValueError("standardized_logit_scale must be positive when provided")
         larger = max(self.qk_branches, self.outer_maps)
         smaller = min(self.qk_branches, self.outer_maps)
         if larger % smaller:
@@ -63,6 +73,10 @@ class DoubleAttentionConfig:
             raise ValueError(
                 f"unsupported dictionary activation: {self.dictionary_activation}"
             )
+        if self.dictionary_assignment not in {"softmax", "silu"}:
+            raise ValueError(
+                f"unsupported dictionary assignment: {self.dictionary_assignment}"
+            )
         if self.map_combine == "concat" and not self.output_projection:
             raise ValueError("concat map combination requires output_projection=True")
 
@@ -74,14 +88,50 @@ class DoubleAttentionConfig:
         return replace(self, **updates)
 
 
-_PRESETS: dict[str, tuple[int, int, int, DictionaryActivation]] = {
-    # name: (Q/K projections, outer softmax maps, routing width, assignment activation)
-    "a1": (1, 1, 256, "identity"),
-    "a1-silu": (1, 1, 256, "silu"),
-    "qk2-s1": (2, 1, 256, "identity"),
-    "qk1-s2": (1, 2, 256, "identity"),
-    "qk2-s2": (2, 2, 256, "identity"),
-    "qk4-s4": (4, 4, 128, "identity"),
+_PRESETS: dict[
+    str, tuple[int, int, int, DictionaryActivation, bool, float | None, bool, bool]
+] = {
+    # name: (Q/K projections, outer maps, routing width, activation,
+    #        standardize logits, explicit pre-beta scale, input norm, output norm)
+    "a1": (1, 1, 256, "identity", False, None, True, True),
+    "a1-silu": (1, 1, 256, "silu", False, None, True, True),
+    "a1-silu-logitnorm": (1, 1, 256, "silu", True, None, False, True),
+    # beta=4 remains fixed, so a pre-beta scale of 0.25 gives softmax(z).
+    "a1-silu-logitnorm-t1": (1, 1, 256, "silu", True, 0.25, False, True),
+    "a1-r512-d512": (1, 1, 512, "identity", False, None, True, True),
+    "a1-r512-d1024": (1, 1, 512, "identity", False, None, True, True),
+    "a1-no-softmax": (1, 1, 256, "identity", False, None, True, True),
+    "a1-no-softmax-g4": (1, 1, 256, "identity", False, None, True, True),
+    "a1-no-qnorm": (1, 1, 256, "identity", False, None, False, True),
+    "a1-no-dpnorm": (1, 1, 256, "identity", False, None, True, False),
+    "a1-no-norm": (1, 1, 256, "identity", False, None, False, False),
+    "qk2-s1": (2, 1, 256, "identity", False, None, True, True),
+    "qk1-s2": (1, 2, 256, "identity", False, None, True, True),
+    "qk2-s2": (2, 2, 256, "identity", False, None, True, True),
+    "qk4-s4": (4, 4, 128, "identity", False, None, True, True),
+}
+
+_PRESET_OVERRIDES: dict[str, dict[str, object]] = {
+    # Preserve the baseline dictionary-logit and outer-attention variances
+    # when routing width grows from 256 to 512.
+    "a1-r512-d512": {
+        "dictionary_size": 512,
+        "beta": 4.0 * (2.0**0.5),
+        "initial_score_scale": 512.0**0.5,
+    },
+    "a1-r512-d1024": {
+        "dictionary_size": 1024,
+        "beta": 4.0 * (2.0**0.5),
+        "initial_score_scale": 512.0**0.5,
+    },
+    "a1-no-softmax": {
+        "dictionary_assignment": "silu",
+        "dictionary_silu_gain": 1.0,
+    },
+    "a1-no-softmax-g4": {
+        "dictionary_assignment": "silu",
+        "dictionary_silu_gain": 4.0,
+    },
 }
 
 
@@ -94,7 +144,16 @@ def experiment_config(name: str, **overrides: object) -> DoubleAttentionConfig:
 
     key = name.lower().replace("_", "-")
     try:
-        qk_branches, outer_maps, routing_dim, dictionary_activation = _PRESETS[key]
+        (
+            qk_branches,
+            outer_maps,
+            routing_dim,
+            dictionary_activation,
+            standardize_dictionary_logits,
+            standardized_logit_scale,
+            normalize_routing_input,
+            normalize_routing_output,
+        ) = _PRESETS[key]
     except KeyError as exc:
         choices = ", ".join(sorted(_PRESETS))
         raise ValueError(f"unknown experiment {name!r}; choose one of: {choices}") from exc
@@ -103,7 +162,12 @@ def experiment_config(name: str, **overrides: object) -> DoubleAttentionConfig:
         "outer_maps": outer_maps,
         "routing_dim": routing_dim,
         "dictionary_activation": dictionary_activation,
+        "standardize_dictionary_logits": standardize_dictionary_logits,
+        "standardized_logit_scale": standardized_logit_scale,
+        "normalize_routing_input": normalize_routing_input,
+        "normalize_routing_output": normalize_routing_output,
     }
+    values.update(_PRESET_OVERRIDES.get(key, {}))
     values.update(overrides)
     return DoubleAttentionConfig(**values)
 

@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from .config import Backend, DictionaryActivation
+from .config import Backend, DictionaryActivation, DictionaryAssignment
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -20,6 +20,12 @@ def dictionary_route_reference(
     beta: Tensor | float,
     eps: float = 1e-6,
     activation: DictionaryActivation = "identity",
+    assignment: DictionaryAssignment = "softmax",
+    silu_gain: float = 1.0,
+    standardize_logits: bool = False,
+    standardized_logit_scale: float | None = None,
+    normalize_input: bool = True,
+    normalize_output: bool = True,
 ) -> Tensor:
     """Reference implementation of the learned dictionary feature map.
 
@@ -30,15 +36,30 @@ def dictionary_route_reference(
         beta: Positive soft-assignment inverse temperature.
     """
 
-    x_normalized = F.normalize(x, dim=-1, eps=eps)
-    logits = x_normalized @ dictionary_key
+    routed_input = F.normalize(x, dim=-1, eps=eps) if normalize_input else x
+    logits = routed_input @ dictionary_key
     if activation == "silu":
         # The factor two preserves unit slope around zero: 2 SiLU(x) ~= x.
         logits = 2.0 * F.silu(logits)
     elif activation != "identity":
         raise ValueError(f"unsupported dictionary activation: {activation}")
-    weights = torch.softmax(logits * beta, dim=-1)
-    return F.normalize(weights @ dictionary_value.transpose(0, 1), dim=-1, eps=eps)
+    if standardize_logits:
+        centered = logits - logits.mean(dim=-1, keepdim=True)
+        inverse_std = torch.rsqrt(centered.square().mean(dim=-1, keepdim=True) + eps)
+        logit_scale = (
+            x.shape[-1] ** -0.5
+            if standardized_logit_scale is None
+            else standardized_logit_scale
+        )
+        logits = centered * inverse_std * logit_scale
+    if assignment == "softmax":
+        weights = torch.softmax(logits * beta, dim=-1)
+    elif assignment == "silu":
+        weights = (2.0 / silu_gain) * F.silu(silu_gain * logits)
+    else:
+        raise ValueError(f"unsupported dictionary assignment: {assignment}")
+    reconstructed = weights @ dictionary_value.transpose(0, 1)
+    return F.normalize(reconstructed, dim=-1, eps=eps) if normalize_output else reconstructed
 
 
 def routed_attention_reference(

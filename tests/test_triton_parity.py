@@ -113,10 +113,32 @@ def test_shared_dictionary_normalization_amp_parity() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    (
+        "silu_logits",
+        "standardize_logits",
+        "standardized_logit_scale",
+        "normalize_input",
+        "normalize_output",
+    ),
+    [
+        (False, False, None, True, True),
+        (True, False, None, True, True),
+        (True, True, None, False, True),
+        (True, True, 0.25, False, True),
+        (False, False, None, False, True),
+        (False, False, None, True, False),
+        (False, False, None, False, False),
+    ],
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("silu_logits", [False, True])
 def test_dictionary_route_forward_and_backward(
-    dtype: torch.dtype, silu_logits: bool
+    dtype: torch.dtype,
+    silu_logits: bool,
+    standardize_logits: bool,
+    standardized_logit_scale: float | None,
+    normalize_input: bool,
+    normalize_output: bool,
 ) -> None:
     torch.manual_seed(0)
     device = torch.device("cuda")
@@ -130,8 +152,28 @@ def test_dictionary_route_forward_and_backward(
     beta = torch.tensor(4.0, device=device, requires_grad=True)
 
     activation = "silu" if silu_logits else "identity"
-    expected = dictionary_route_reference(x, dk, dv, beta, activation=activation)
-    actual = dictionary_route_triton(x, dk, dv, beta, silu_logits=silu_logits)
+    expected = dictionary_route_reference(
+        x,
+        dk,
+        dv,
+        beta,
+        activation=activation,
+        standardize_logits=standardize_logits,
+        standardized_logit_scale=standardized_logit_scale,
+        normalize_input=normalize_input,
+        normalize_output=normalize_output,
+    )
+    actual = dictionary_route_triton(
+        x,
+        dk,
+        dv,
+        beta,
+        silu_logits=silu_logits,
+        standardize_logits=standardize_logits,
+        standardized_logit_scale=standardized_logit_scale,
+        normalize_input=normalize_input,
+        normalize_output=normalize_output,
+    )
     torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
 
     gradient = torch.randn_like(actual)
@@ -140,8 +182,56 @@ def test_dictionary_route_forward_and_backward(
     for tensor in (x, dk, dv, beta):
         tensor.grad = None
     expected.backward(gradient)
-    for actual_gradient, tensor in zip(actual_gradients, (x, dk, dv, beta), strict=True):
-        torch.testing.assert_close(actual_gradient, tensor.grad, atol=3e-2, rtol=3e-2)
+    for index, (actual_gradient, tensor) in enumerate(
+        zip(actual_gradients, (x, dk, dv, beta), strict=True)
+    ):
+        reference_gradient = tensor.grad
+        assert reference_gradient is not None
+        atol = 3e-1 if dtype == torch.bfloat16 and not normalize_input else 3e-2
+        torch.testing.assert_close(
+            actual_gradient, reference_gradient, atol=atol, rtol=3e-2
+        )
+        if index < 3:
+            error_rms = (actual_gradient.float() - reference_gradient.float()).square().mean().sqrt()
+            reference_rms = reference_gradient.float().square().mean().sqrt()
+            assert error_rms / reference_rms.clamp_min(1e-12) < 3e-2
+
+
+@pytest.mark.parametrize("gain", [1.0, 4.0])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_direct_silu_dictionary_route_forward_and_backward(
+    dtype: torch.dtype, gain: float
+) -> None:
+    torch.manual_seed(41 + int(gain))
+    device = torch.device("cuda")
+    x = torch.randn(1, 2, 11, 256, device=device, dtype=dtype, requires_grad=True)
+    dk = torch.nn.functional.normalize(
+        torch.randn(256, 512, device=device, dtype=dtype), dim=0
+    ).requires_grad_()
+    dv = torch.nn.functional.normalize(
+        torch.randn(256, 512, device=device, dtype=dtype), dim=0
+    ).requires_grad_()
+    beta = torch.tensor(4.0, device=device)
+
+    expected = dictionary_route_reference(
+        x, dk, dv, beta, assignment="silu", silu_gain=gain
+    )
+    actual = dictionary_route_triton(
+        x, dk, dv, beta, direct_silu=True, silu_gain=gain
+    )
+    torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+
+    gradient = torch.randn_like(actual)
+    actual.backward(gradient, retain_graph=True)
+    actual_gradients = tuple(tensor.grad.clone() for tensor in (x, dk, dv))
+    for tensor in (x, dk, dv):
+        tensor.grad = None
+    expected.backward(gradient)
+    for actual_gradient, tensor in zip(
+        actual_gradients, (x, dk, dv), strict=True
+    ):
+        assert tensor.grad is not None
+        torch.testing.assert_close(actual_gradient, tensor.grad, atol=5e-2, rtol=5e-2)
 
 
 def test_dictionary_route_fixed_beta_backward() -> None:
@@ -169,6 +259,43 @@ def test_dictionary_route_fixed_beta_backward() -> None:
         torch.testing.assert_close(actual_gradient, tensor.grad, atol=3e-2, rtol=3e-2)
 
 
+@pytest.mark.parametrize("dictionary_size", [512, 1024])
+def test_wide_dictionary_route_forward_backward(dictionary_size: int) -> None:
+    torch.manual_seed(31 + dictionary_size)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    x = torch.randn(1, 2, 7, 512, device=device, dtype=dtype, requires_grad=True)
+    dictionary_key = torch.nn.functional.normalize(
+        torch.randn(512, dictionary_size, device=device, dtype=dtype), dim=0
+    ).requires_grad_()
+    dictionary_value = torch.nn.functional.normalize(
+        torch.randn(512, dictionary_size, device=device, dtype=dtype), dim=0
+    ).requires_grad_()
+    beta = torch.tensor(4.0 * (2.0**0.5), device=device, requires_grad=True)
+
+    expected = dictionary_route_reference(
+        x, dictionary_key, dictionary_value, beta
+    )
+    actual = dictionary_route_triton(x, dictionary_key, dictionary_value, beta)
+    torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+
+    gradient = torch.randn_like(actual)
+    actual.backward(gradient, retain_graph=True)
+    actual_gradients = tuple(
+        tensor.grad.clone() for tensor in (x, dictionary_key, dictionary_value, beta)
+    )
+    for tensor in (x, dictionary_key, dictionary_value, beta):
+        tensor.grad = None
+    expected.backward(gradient)
+    for actual_gradient, tensor in zip(
+        actual_gradients,
+        (x, dictionary_key, dictionary_value, beta),
+        strict=True,
+    ):
+        assert tensor.grad is not None
+        torch.testing.assert_close(actual_gradient, tensor.grad, atol=3e-2, rtol=3e-2)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_fused_normalized_assignment_matches_cublas(dtype: torch.dtype) -> None:
     torch.manual_seed(7)
@@ -191,13 +318,34 @@ def test_fused_normalized_assignment_matches_cublas(dtype: torch.dtype) -> None:
     torch.testing.assert_close(logits, expected_logits, atol=3e-2, rtol=3e-2)
 
 
+@pytest.mark.parametrize(
+    (
+        "silu_logits",
+        "standardize_logits",
+        "standardized_logit_scale",
+        "normalize_input",
+        "normalize_output",
+    ),
+    [
+        (False, False, None, True, True),
+        (True, False, None, True, True),
+        (True, True, None, False, True),
+        (True, True, 0.25, False, True),
+        (False, False, None, False, True),
+        (False, False, None, True, False),
+        (False, False, None, False, False),
+    ],
+)
 @pytest.mark.parametrize("routing_dim", [128, 256])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("silu_logits", [False, True])
 def test_fully_fused_dictionary_route_forward_backward(
     dtype: torch.dtype,
     routing_dim: int,
     silu_logits: bool,
+    standardize_logits: bool,
+    standardized_logit_scale: float | None,
+    normalize_input: bool,
+    normalize_output: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(triton_kernels, "FUSED_DICTIONARY_ROUTE", True)
@@ -215,10 +363,26 @@ def test_fully_fused_dictionary_route_forward_backward(
 
     activation = "silu" if silu_logits else "identity"
     expected = dictionary_route_reference(
-        x, dictionary_key, dictionary_value, beta, activation=activation
+        x,
+        dictionary_key,
+        dictionary_value,
+        beta,
+        activation=activation,
+        standardize_logits=standardize_logits,
+        standardized_logit_scale=standardized_logit_scale,
+        normalize_input=normalize_input,
+        normalize_output=normalize_output,
     )
     actual = dictionary_route_triton(
-        x, dictionary_key, dictionary_value, beta, silu_logits=silu_logits
+        x,
+        dictionary_key,
+        dictionary_value,
+        beta,
+        silu_logits=silu_logits,
+        standardize_logits=standardize_logits,
+        standardized_logit_scale=standardized_logit_scale,
+        normalize_input=normalize_input,
+        normalize_output=normalize_output,
     )
     torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
 
@@ -230,12 +394,23 @@ def test_fully_fused_dictionary_route_forward_backward(
     for tensor in (x, dictionary_key, dictionary_value, beta):
         tensor.grad = None
     expected.backward(gradient)
-    for actual_gradient, tensor in zip(
-        actual_gradients,
-        (x, dictionary_key, dictionary_value, beta),
-        strict=True,
+    for index, (actual_gradient, tensor) in enumerate(
+        zip(
+            actual_gradients,
+            (x, dictionary_key, dictionary_value, beta),
+            strict=True,
+        )
     ):
-        torch.testing.assert_close(actual_gradient, tensor.grad, atol=3e-2, rtol=3e-2)
+        reference_gradient = tensor.grad
+        assert reference_gradient is not None
+        atol = 3e-1 if dtype == torch.bfloat16 and not normalize_input else 3e-2
+        torch.testing.assert_close(
+            actual_gradient, reference_gradient, atol=atol, rtol=3e-2
+        )
+        if index < 3:
+            error_rms = (actual_gradient.float() - reference_gradient.float()).square().mean().sqrt()
+            reference_rms = reference_gradient.float().square().mean().sqrt()
+            assert error_rms / reference_rms.clamp_min(1e-12) < 3e-2
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

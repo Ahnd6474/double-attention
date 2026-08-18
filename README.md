@@ -34,6 +34,15 @@ project report. Dictionaries can be global or shared by layer groups.
 |---|---:|---:|---:|---|
 | `a1` | 1 | 1 | 256 | current single-map model |
 | `a1-silu` | 1 | 1 | 256 | apply `2 SiLU` to dictionary logits before assignment softmax |
+| `a1-silu-logitnorm` | 1 | 1 | 256 | raw Q/K, then `2 SiLU`, atom-axis standardization, and `1/sqrt(routing_dim)` scaling |
+| `a1-silu-logitnorm-t1` | 1 | 1 | 256 | same post-SiLU standardization with unit final softmax scale: `softmax(z)` |
+| `a1-r512-d512` | 1 | 1 | 512 | remove the Q/K routing bottleneck at fixed dictionary size, with calibrated temperatures |
+| `a1-r512-d1024` | 1 | 1 | 512 | remove the bottleneck while retaining the 2x dictionary expansion ratio |
+| `a1-no-softmax` | 1 | 1 | 256 | replace simplex assignment with signed `2 SiLU(D^T q)` dictionary coefficients |
+| `a1-no-softmax-g4` | 1 | 1 | 256 | direct SiLU coefficients with gain 4 and unit slope at the origin |
+| `a1-no-qnorm` | 1 | 1 | 256 | remove Q/K row normalization before dictionary assignment |
+| `a1-no-dpnorm` | 1 | 1 | 256 | keep the reconstructed `Dp` magnitude |
+| `a1-no-norm` | 1 | 1 | 256 | remove both routing row normalizations |
 | `qk2-s1` | 2 | 1 | 256 | isolate independent Q/K projections |
 | `qk1-s2` | 1 | 2 | 256 | isolate outer-softmax multiplicity |
 | `qk2-s2` | 2 | 2 | 256 | combine both effects |

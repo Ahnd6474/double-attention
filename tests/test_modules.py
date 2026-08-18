@@ -53,6 +53,36 @@ def test_all_experiment_variants_forward_and_backward(name: str) -> None:
     assert module.bank.raw_key.grad is not None
 
 
+@pytest.mark.parametrize(
+    ("name", "gain"),
+    [("a1-no-softmax", 1.0), ("a1-no-softmax-g4", 4.0)],
+)
+def test_direct_silu_assignment_matches_formula(name: str, gain: float) -> None:
+    torch.manual_seed(19)
+    config = small_config(name)
+    x = torch.randn(2, 5, config.routing_dim)
+    dictionary = F.normalize(
+        torch.randn(config.routing_dim, config.dictionary_size), dim=0
+    )
+
+    actual = dictionary_route_reference(
+        x,
+        dictionary,
+        dictionary,
+        config.beta,
+        assignment=config.dictionary_assignment,
+        silu_gain=config.dictionary_silu_gain,
+    )
+    normalized_x = F.normalize(x, dim=-1)
+    coefficients = (2.0 / gain) * F.silu(gain * (normalized_x @ dictionary))
+    expected = F.normalize(coefficients @ dictionary.T, dim=-1)
+
+    assert config.dictionary_assignment == "silu"
+    assert config.dictionary_silu_gain == gain
+    assert (coefficients < 0).any()
+    torch.testing.assert_close(actual, expected)
+
+
 def test_qk2_s1_concatenates_two_score_geometries() -> None:
     module = SharedDictionaryAttention(small_config("qk2-s1"))
     _, aux = module(torch.randn(1, 5, 32), return_aux=True)
@@ -115,6 +145,101 @@ def test_a1_silu_activates_dictionary_logits_before_softmax() -> None:
 
     torch.testing.assert_close(actual, expected)
     assert experiment_config("a1-silu").dictionary_activation == "silu"
+
+
+def test_a1_silu_logitnorm_standardizes_after_activation() -> None:
+    torch.manual_seed(23)
+    x = torch.randn(2, 3, 8)
+    dictionary = F.normalize(torch.randn(8, 16), dim=0)
+    beta = torch.tensor(4.0)
+
+    actual = dictionary_route_reference(
+        x,
+        dictionary,
+        dictionary,
+        beta,
+        activation="silu",
+        standardize_logits=True,
+        normalize_input=False,
+    )
+    activated = 2.0 * F.silu(x @ dictionary)
+    centered = activated - activated.mean(dim=-1, keepdim=True)
+    calibrated = centered * torch.rsqrt(
+        centered.square().mean(dim=-1, keepdim=True) + 1e-6
+    ) * (x.shape[-1] ** -0.5)
+    expected = F.normalize(
+        torch.softmax(beta * calibrated, dim=-1) @ dictionary.T,
+        dim=-1,
+    )
+
+    torch.testing.assert_close(actual, expected)
+    config = experiment_config("a1-silu-logitnorm")
+    assert config.dictionary_activation == "silu"
+    assert config.standardize_dictionary_logits
+    assert not config.normalize_routing_input
+    assert config.normalize_routing_output
+
+
+def test_a1_silu_logitnorm_t1_uses_unit_softmax_scale() -> None:
+    torch.manual_seed(29)
+    x = torch.randn(2, 3, 8)
+    dictionary = F.normalize(torch.randn(8, 16), dim=0)
+    beta = torch.tensor(4.0)
+
+    actual = dictionary_route_reference(
+        x,
+        dictionary,
+        dictionary,
+        beta,
+        activation="silu",
+        standardize_logits=True,
+        standardized_logit_scale=0.25,
+        normalize_input=False,
+    )
+    activated = 2.0 * F.silu(x @ dictionary)
+    centered = activated - activated.mean(dim=-1, keepdim=True)
+    standardized = centered * torch.rsqrt(
+        centered.square().mean(dim=-1, keepdim=True) + 1e-6
+    )
+    expected = F.normalize(
+        torch.softmax(standardized, dim=-1) @ dictionary.T,
+        dim=-1,
+    )
+
+    torch.testing.assert_close(actual, expected)
+    config = experiment_config("a1-silu-logitnorm-t1")
+    assert config.standardized_logit_scale == 0.25
+
+
+@pytest.mark.parametrize(
+    ("name", "dictionary_size"),
+    [("a1-r512-d512", 512), ("a1-r512-d1024", 1024)],
+)
+def test_a1_r512_presets_calibrate_temperature(
+    name: str, dictionary_size: int
+) -> None:
+    config = experiment_config(name)
+    assert config.routing_dim == 512
+    assert config.dictionary_size == dictionary_size
+    assert config.beta == pytest.approx(4.0 * (2.0**0.5))
+    assert config.initial_score_scale == pytest.approx(512.0**0.5)
+
+
+@pytest.mark.parametrize(
+    ("name", "normalize_input", "normalize_output"),
+    [
+        ("a1", True, True),
+        ("a1-no-qnorm", False, True),
+        ("a1-no-dpnorm", True, False),
+        ("a1-no-norm", False, False),
+    ],
+)
+def test_a1_normalization_presets(
+    name: str, normalize_input: bool, normalize_output: bool
+) -> None:
+    config = experiment_config(name)
+    assert config.normalize_routing_input is normalize_input
+    assert config.normalize_routing_output is normalize_output
 
 
 def test_causal_prefix_is_independent_of_future_tokens() -> None:
