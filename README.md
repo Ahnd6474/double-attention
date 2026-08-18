@@ -41,6 +41,7 @@ project report. Dictionaries can be global or shared by layer groups.
 | `a1-r512-d1536` | 1 | 1 | 512 | 512-wide attention and 1,536 atoms with the standard learned FFN |
 | `a1-r512-d1536-qffn` | 1 | 1 | 512 | full-rank `W GELU(D^T Q x)` using 512-wide attention |
 | `a1-r512-d2855-qffn` | 1 | 1 | 512 | parameter-matched full-rank Q-D FFN with 2,855 atoms/hidden units |
+| `a1-r512-d1764-qffn-l8` | 1 | 1 | 512 | parameter-matched 8-layer Q-D FFN with 1,764 atoms/hidden units |
 | `a1-d1536` | 1 | 1 | 256 | 1,536 dictionary atoms with the standard learned FFN |
 | `a1-d1536-qffn` | 1 | 1 | 256 | reuse attention Q and D as the FFN expansion: `W GELU(D^T Q x)` |
 | `a1-no-softmax` | 1 | 1 | 256 | replace simplex assignment with signed `2 SiLU(D^T q)` dictionary coefficients |

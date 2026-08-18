@@ -1,5 +1,12 @@
 from .baselines import MHA4Attention, MHA4Block, MHA4LM
 from .config import DoubleAttentionConfig, experiment_config, experiment_names
+from .lldm import (
+    LLDMConfig,
+    LLDMAux,
+    LayerLocalDictionaryMixerBlock,
+    LayerLocalDictionaryMixerLM,
+    LayerLocalDictionaryMixerStack,
+)
 from .modules import (
     DoubleAttentionAux,
     DoubleAttentionBlock,
@@ -21,6 +28,11 @@ __all__ = [
     "DoubleAttentionConfig",
     "DoubleAttentionLM",
     "DoubleAttentionStack",
+    "LLDMConfig",
+    "LLDMAux",
+    "LayerLocalDictionaryMixerBlock",
+    "LayerLocalDictionaryMixerLM",
+    "LayerLocalDictionaryMixerStack",
     "MHA4Attention",
     "MHA4Block",
     "MHA4LM",

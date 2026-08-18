@@ -1,0 +1,35 @@
+{
+  "variant": "lldm2",
+  "dictionary": "layer-local",
+  "corpus": "docs_sp2048_ids",
+  "vocab_size": 2048,
+  "seed": 0,
+  "parameters": 8986142,
+  "device": "NVIDIA GeForce RTX 5060 Laptop GPU",
+  "amp_dtype": "torch.bfloat16",
+  "micro_batch": 8,
+  "effective_batch": 8,
+  "sequence_length": 64,
+  "training_tokens": 4112055,
+  "validation_tokens": 216424,
+  "test_tokens": 0,
+  "start_step": 0,
+  "steps": 100,
+  "schedule_steps": 12000,
+  "tokens_seen": 51200,
+  "robust_a": 6.082848332822323,
+  "robust_b": 6.090461269021034,
+  "robust_mean": 6.0866548009216785,
+  "perplexity": 439.94723572809056,
+  "history": [
+    {
+      "step": 100,
+      "train_loss": 6.115997314453125,
+      "validation_loss": 6.114516079425812,
+      "tokens_seen": 51200,
+      "learning_rate": 9.999999999999999e-05,
+      "chunk_seconds": 4.467805399995996,
+      "max_memory_mib": 325.62353515625
+    }
+  ]
+}

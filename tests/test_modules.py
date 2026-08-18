@@ -220,6 +220,7 @@ def test_a1_silu_logitnorm_t1_uses_unit_softmax_scale() -> None:
         ("a1-r512-d1536", 1536),
         ("a1-r512-d1536-qffn", 1536),
         ("a1-r512-d2855-qffn", 2855),
+        ("a1-r512-d1764-qffn-l8", 1764),
     ],
 )
 def test_a1_r512_presets_calibrate_temperature(
@@ -238,6 +239,7 @@ def test_d1536_presets_keep_routing_width_and_select_q_ffn() -> None:
     full_rank_control = experiment_config("a1-r512-d1536")
     full_rank_q_ffn = experiment_config("a1-r512-d1536-qffn")
     matched_q_ffn = experiment_config("a1-r512-d2855-qffn")
+    deep_matched_q_ffn = experiment_config("a1-r512-d1764-qffn-l8")
     assert control.routing_dim == q_ffn.routing_dim == 256
     assert control.dictionary_size == q_ffn.dictionary_size == 1536
     assert not control.q_dictionary_feedforward
@@ -249,6 +251,9 @@ def test_d1536_presets_keep_routing_width_and_select_q_ffn() -> None:
     assert matched_q_ffn.routing_dim == 512
     assert matched_q_ffn.dictionary_size == 2855
     assert matched_q_ffn.q_dictionary_feedforward
+    assert deep_matched_q_ffn.routing_dim == 512
+    assert deep_matched_q_ffn.dictionary_size == 1764
+    assert deep_matched_q_ffn.q_dictionary_feedforward
 
 
 def test_q_dictionary_ffn_matches_w_gelu_dt_qx_formula() -> None:

@@ -104,6 +104,7 @@ _PRESETS: dict[
     "a1-r512-d1536": (1, 1, 512, "identity", False, None, True, True),
     "a1-r512-d1536-qffn": (1, 1, 512, "identity", False, None, True, True),
     "a1-r512-d2855-qffn": (1, 1, 512, "identity", False, None, True, True),
+    "a1-r512-d1764-qffn-l8": (1, 1, 512, "identity", False, None, True, True),
     "a1-d1536": (1, 1, 256, "identity", False, None, True, True),
     "a1-d1536-qffn": (1, 1, 256, "identity", False, None, True, True),
     "a1-no-softmax": (1, 1, 256, "identity", False, None, True, True),
@@ -143,6 +144,12 @@ _PRESET_OVERRIDES: dict[str, dict[str, object]] = {
     },
     "a1-r512-d2855-qffn": {
         "dictionary_size": 2855,
+        "beta": 4.0 * (2.0**0.5),
+        "initial_score_scale": 512.0**0.5,
+        "q_dictionary_feedforward": True,
+    },
+    "a1-r512-d1764-qffn-l8": {
+        "dictionary_size": 1764,
         "beta": 4.0 * (2.0**0.5),
         "initial_score_scale": 512.0**0.5,
         "q_dictionary_feedforward": True,

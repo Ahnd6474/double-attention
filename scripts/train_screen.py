@@ -13,7 +13,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from double_attention import DoubleAttentionLM, MHA4LM, experiment_config
+from double_attention import (
+    DoubleAttentionLM,
+    LLDMConfig,
+    LayerLocalDictionaryMixerLM,
+    MHA4LM,
+    experiment_config,
+)
 from double_attention.data import load_token_splits
 
 
@@ -27,6 +33,7 @@ VARIANTS = (
     "a1-r512-d1536",
     "a1-r512-d1536-qffn",
     "a1-r512-d2855-qffn",
+    "a1-r512-d1764-qffn-l8",
     "a1-d1536",
     "a1-d1536-qffn",
     "a1-no-softmax",
@@ -38,6 +45,13 @@ VARIANTS = (
     "qk1-s2",
     "qk2-s2",
     "qk4-s4",
+    "lldm2",
+    "lldm2-pm",
+    "lldm2-pm-centered",
+    "lldm2-pm-sharp",
+    "lldm2-separate-out",
+    "lldm2-independent-rel",
+    "lldm2-independent-qk",
     "mha4",
 )
 
@@ -57,6 +71,8 @@ def deterministic_initialize(model: nn.Module, base_seed: int) -> None:
             nn.init.normal_(parameter, std=parameter.shape[0] ** -0.5, generator=generator)
         elif name.endswith("norm.weight") or ".norm.weight" in name:
             parameter.fill_(1.0)
+        elif "_gates." in name:
+            nn.init.normal_(parameter, mean=1.0, std=0.02, generator=generator)
         elif name.endswith("bias"):
             parameter.zero_()
         elif parameter.ndim >= 2:
@@ -83,6 +99,47 @@ def make_model(
             feedforward_dim=1536,
             max_sequence_length=sequence_length,
         )
+    elif variant in {
+        "lldm2",
+        "lldm2-pm",
+        "lldm2-pm-centered",
+        "lldm2-pm-sharp",
+        "lldm2-separate-out",
+        "lldm2-independent-rel",
+        "lldm2-independent-qk",
+    }:
+        parameter_matched = variant not in {"lldm2", "lldm2-separate-out"}
+        separate_output = variant in {"lldm2-separate-out", "lldm2-independent-qk"}
+        independent_relational = variant == "lldm2-independent-rel"
+        independent_query_key = variant == "lldm2-independent-qk"
+        model = LayerLocalDictionaryMixerLM(
+            vocab_size=vocab_size,
+            max_sequence_length=sequence_length,
+            config=LLDMConfig(
+                model_dim=512,
+                dictionary_size=(
+                    1264
+                    if independent_relational
+                    else (
+                        1024
+                        if independent_query_key
+                        else (1152 if separate_output else (1536 if parameter_matched else 1024))
+                    )
+                ),
+                relational_dim=(
+                    128
+                    if independent_relational or independent_query_key
+                    else (256 if separate_output or parameter_matched else 128)
+                ),
+                relational_maps=2,
+                center_relational_assignments=variant == "lldm2-pm-centered",
+                assignment_scale=1.0 if variant == "lldm2-pm-sharp" else 0.25,
+                separate_context_output=separate_output,
+                independent_relational_readouts=independent_relational,
+                independent_query_key=independent_query_key,
+            ),
+            num_layers=6,
+        )
     else:
         config = experiment_config(
             variant,
@@ -91,12 +148,13 @@ def make_model(
             untied_dictionary=dictionary == "untied",
             output_projection=True,
         )
+        num_layers = 8 if variant == "a1-r512-d1764-qffn-l8" else 6
         model = DoubleAttentionLM(
             vocab_size=vocab_size,
             max_sequence_length=sequence_length,
             config=config,
-            num_layers=6,
-            dictionary_group_size=6,
+            num_layers=num_layers,
+            dictionary_group_size=num_layers,
             feedforward_dim=(config.dictionary_size if config.q_dictionary_feedforward else 1536),
         )
     deterministic_initialize(model, 1000 + seed)
@@ -263,7 +321,22 @@ def main() -> None:
     accumulation_steps = args.effective_batch // args.micro_batch
     generator = torch.Generator().manual_seed(7000 + args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    dictionary_tag = "" if args.dictionary == "untied" or args.variant == "mha4" else "_tied"
+    dictionary_tag = (
+        ""
+        if args.dictionary == "untied"
+        or args.variant
+        in {
+            "mha4",
+            "lldm2",
+            "lldm2-pm",
+            "lldm2-pm-centered",
+            "lldm2-pm-sharp",
+            "lldm2-separate-out",
+            "lldm2-independent-rel",
+            "lldm2-independent-qk",
+        }
+        else "_tied"
+    )
     run_name = (
         f"{args.variant}{dictionary_tag}_s{args.seed}_steps{args.steps}_sched{args.schedule_steps}"
     )
@@ -287,7 +360,20 @@ def main() -> None:
 
     metadata = {
         "variant": args.variant,
-        "dictionary": "none" if args.variant == "mha4" else args.dictionary,
+        "dictionary": (
+            "layer-local"
+            if args.variant
+            in {
+                "lldm2",
+                "lldm2-pm",
+                "lldm2-pm-centered",
+                "lldm2-pm-sharp",
+                "lldm2-separate-out",
+                "lldm2-independent-rel",
+                "lldm2-independent-qk",
+            }
+            else ("none" if args.variant == "mha4" else args.dictionary)
+        ),
         "corpus": args.corpus_name or (args.train_ids or args.ids).stem,
         "vocab_size": vocab_size,
         "seed": args.seed,
