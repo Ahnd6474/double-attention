@@ -114,7 +114,10 @@ def test_shared_dictionary_normalization_amp_parity() -> None:
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_dictionary_route_forward_and_backward(dtype: torch.dtype) -> None:
+@pytest.mark.parametrize("silu_logits", [False, True])
+def test_dictionary_route_forward_and_backward(
+    dtype: torch.dtype, silu_logits: bool
+) -> None:
     torch.manual_seed(0)
     device = torch.device("cuda")
     x = torch.randn(2, 3, 17, 64, device=device, dtype=dtype, requires_grad=True)
@@ -126,8 +129,9 @@ def test_dictionary_route_forward_and_backward(dtype: torch.dtype) -> None:
     ).requires_grad_()
     beta = torch.tensor(4.0, device=device, requires_grad=True)
 
-    expected = dictionary_route_reference(x, dk, dv, beta)
-    actual = dictionary_route_triton(x, dk, dv, beta)
+    activation = "silu" if silu_logits else "identity"
+    expected = dictionary_route_reference(x, dk, dv, beta, activation=activation)
+    actual = dictionary_route_triton(x, dk, dv, beta, silu_logits=silu_logits)
     torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
 
     gradient = torch.randn_like(actual)
@@ -189,9 +193,11 @@ def test_fused_normalized_assignment_matches_cublas(dtype: torch.dtype) -> None:
 
 @pytest.mark.parametrize("routing_dim", [128, 256])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("silu_logits", [False, True])
 def test_fully_fused_dictionary_route_forward_backward(
     dtype: torch.dtype,
     routing_dim: int,
+    silu_logits: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(triton_kernels, "FUSED_DICTIONARY_ROUTE", True)
@@ -207,8 +213,13 @@ def test_fully_fused_dictionary_route_forward_backward(
     ).requires_grad_()
     beta = torch.tensor(4.0, device=device, requires_grad=True)
 
-    expected = dictionary_route_reference(x, dictionary_key, dictionary_value, beta)
-    actual = dictionary_route_triton(x, dictionary_key, dictionary_value, beta)
+    activation = "silu" if silu_logits else "identity"
+    expected = dictionary_route_reference(
+        x, dictionary_key, dictionary_value, beta, activation=activation
+    )
+    actual = dictionary_route_triton(
+        x, dictionary_key, dictionary_value, beta, silu_logits=silu_logits
+    )
     torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
 
     gradient = torch.randn_like(actual)

@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from .config import Backend
+from .config import Backend, DictionaryActivation
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -19,6 +19,7 @@ def dictionary_route_reference(
     dictionary_value: Tensor,
     beta: Tensor | float,
     eps: float = 1e-6,
+    activation: DictionaryActivation = "identity",
 ) -> Tensor:
     """Reference implementation of the learned dictionary feature map.
 
@@ -30,7 +31,13 @@ def dictionary_route_reference(
     """
 
     x_normalized = F.normalize(x, dim=-1, eps=eps)
-    weights = torch.softmax((x_normalized @ dictionary_key) * beta, dim=-1)
+    logits = x_normalized @ dictionary_key
+    if activation == "silu":
+        # The factor two preserves unit slope around zero: 2 SiLU(x) ~= x.
+        logits = 2.0 * F.silu(logits)
+    elif activation != "identity":
+        raise ValueError(f"unsupported dictionary activation: {activation}")
+    weights = torch.softmax(logits * beta, dim=-1)
     return F.normalize(weights @ dictionary_value.transpose(0, 1), dim=-1, eps=eps)
 
 

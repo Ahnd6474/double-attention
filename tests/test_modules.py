@@ -5,6 +5,7 @@ import math
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 import double_attention.modules as attention_modules
 from double_attention import (
@@ -16,6 +17,7 @@ from double_attention import (
     experiment_config,
     experiment_names,
 )
+from double_attention.ops import dictionary_route_reference
 
 
 def small_config(name: str, **overrides: object) -> DoubleAttentionConfig:
@@ -98,6 +100,21 @@ def test_qk1_s2_repeats_geometry_but_breaks_temperature_symmetry() -> None:
     _, aux = module(torch.randn(1, 5, 32), return_aux=True)
     torch.testing.assert_close(aux.score_query[:, 0], aux.score_query[:, 1])
     assert aux.score_scales[0] != aux.score_scales[1]
+
+
+def test_a1_silu_activates_dictionary_logits_before_softmax() -> None:
+    torch.manual_seed(19)
+    x = torch.randn(2, 3, 8)
+    dictionary = F.normalize(torch.randn(8, 16), dim=0)
+    beta = torch.tensor(4.0)
+
+    actual = dictionary_route_reference(x, dictionary, dictionary, beta, activation="silu")
+    normalized = F.normalize(x, dim=-1)
+    logits = 2.0 * F.silu(normalized @ dictionary)
+    expected = F.normalize(torch.softmax(beta * logits, dim=-1) @ dictionary.T, dim=-1)
+
+    torch.testing.assert_close(actual, expected)
+    assert experiment_config("a1-silu").dictionary_activation == "silu"
 
 
 def test_causal_prefix_is_independent_of_future_tokens() -> None:

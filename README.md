@@ -33,6 +33,7 @@ project report. Dictionaries can be global or shared by layer groups.
 | preset | Q/K branches | outer softmaxes | routing width/branch | purpose |
 |---|---:|---:|---:|---|
 | `a1` | 1 | 1 | 256 | current single-map model |
+| `a1-silu` | 1 | 1 | 256 | apply `2 SiLU` to dictionary logits before assignment softmax |
 | `qk2-s1` | 2 | 1 | 256 | isolate independent Q/K projections |
 | `qk1-s2` | 1 | 2 | 256 | isolate outer-softmax multiplicity |
 | `qk2-s2` | 2 | 2 | 256 | combine both effects |

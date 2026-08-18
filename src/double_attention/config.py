@@ -6,6 +6,7 @@ from typing import Literal
 
 Backend = Literal["auto", "torch", "triton"]
 MapCombine = Literal["weighted_sum", "concat"]
+DictionaryActivation = Literal["identity", "silu"]
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,7 @@ class DoubleAttentionConfig:
     beta: float = 4.0
     initial_score_scale: float = 16.0
     learnable_beta: bool = False
+    dictionary_activation: DictionaryActivation = "identity"
     untied_dictionary: bool = True
     output_projection: bool = True
     value_bias: bool = True
@@ -57,6 +59,10 @@ class DoubleAttentionConfig:
             raise ValueError(f"unsupported backend: {self.backend}")
         if self.map_combine not in {"weighted_sum", "concat"}:
             raise ValueError(f"unsupported map_combine: {self.map_combine}")
+        if self.dictionary_activation not in {"identity", "silu"}:
+            raise ValueError(
+                f"unsupported dictionary activation: {self.dictionary_activation}"
+            )
         if self.map_combine == "concat" and not self.output_projection:
             raise ValueError("concat map combination requires output_projection=True")
 
@@ -68,13 +74,14 @@ class DoubleAttentionConfig:
         return replace(self, **updates)
 
 
-_PRESETS: dict[str, tuple[int, int, int]] = {
-    # name: (Q/K projections, outer softmax maps, routing width per branch)
-    "a1": (1, 1, 256),
-    "qk2-s1": (2, 1, 256),
-    "qk1-s2": (1, 2, 256),
-    "qk2-s2": (2, 2, 256),
-    "qk4-s4": (4, 4, 128),
+_PRESETS: dict[str, tuple[int, int, int, DictionaryActivation]] = {
+    # name: (Q/K projections, outer softmax maps, routing width, assignment activation)
+    "a1": (1, 1, 256, "identity"),
+    "a1-silu": (1, 1, 256, "silu"),
+    "qk2-s1": (2, 1, 256, "identity"),
+    "qk1-s2": (1, 2, 256, "identity"),
+    "qk2-s2": (2, 2, 256, "identity"),
+    "qk4-s4": (4, 4, 128, "identity"),
 }
 
 
@@ -87,7 +94,7 @@ def experiment_config(name: str, **overrides: object) -> DoubleAttentionConfig:
 
     key = name.lower().replace("_", "-")
     try:
-        qk_branches, outer_maps, routing_dim = _PRESETS[key]
+        qk_branches, outer_maps, routing_dim, dictionary_activation = _PRESETS[key]
     except KeyError as exc:
         choices = ", ".join(sorted(_PRESETS))
         raise ValueError(f"unknown experiment {name!r}; choose one of: {choices}") from exc
@@ -95,6 +102,7 @@ def experiment_config(name: str, **overrides: object) -> DoubleAttentionConfig:
         "qk_branches": qk_branches,
         "outer_maps": outer_maps,
         "routing_dim": routing_dim,
+        "dictionary_activation": dictionary_activation,
     }
     values.update(overrides)
     return DoubleAttentionConfig(**values)

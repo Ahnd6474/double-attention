@@ -164,6 +164,7 @@ class SharedDictionaryAttention(nn.Module):
                 dictionary_value,
                 self.beta,
                 self.config.eps,
+                self.config.dictionary_activation == "silu",
             )
         return dictionary_route_reference(
             x,
@@ -171,6 +172,7 @@ class SharedDictionaryAttention(nn.Module):
             dictionary_value,
             self.beta,
             self.config.eps,
+            self.config.dictionary_activation,
         )
 
     def forward(

@@ -150,6 +150,7 @@ if TRITON_AVAILABLE:
         BLOCK_K: tl.constexpr,
         BLOCK_ATOMS: tl.constexpr,
         DICTIONARY_SIZE: tl.constexpr,
+        SILU_LOGITS: tl.constexpr,
     ):
         row_offsets = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
         routing_offsets = tl.arange(0, BLOCK_R)
@@ -203,8 +204,12 @@ if TRITON_AVAILABLE:
             )
             logits += tl.dot(input_tile_for_dot, dictionary_key)
 
+        assignment_logits = logits
+        if SILU_LOGITS:
+            sigmoid = 1.0 / (1.0 + tl.exp(-logits))
+            assignment_logits = 2.0 * logits * sigmoid
         beta = tl.load(beta_ptr).to(tl.float32)
-        scaled_logits = logits * beta
+        scaled_logits = assignment_logits * beta
         scaled_logits = scaled_logits - tl.max(scaled_logits, axis=1)[:, None]
         numerators = tl.exp(scaled_logits)
         weights = numerators / tl.sum(numerators, axis=1)[:, None]
@@ -302,6 +307,7 @@ if TRITON_AVAILABLE:
         BLOCK_K: tl.constexpr,
         BLOCK_ATOMS: tl.constexpr,
         DICTIONARY_SIZE: tl.constexpr,
+        SILU_LOGITS: tl.constexpr,
     ):
         row_offsets = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
         routing_offsets = tl.arange(0, BLOCK_R)
@@ -375,6 +381,17 @@ if TRITON_AVAILABLE:
         grad_scaled_logits = weights * centered
         beta = tl.load(beta_ptr).to(tl.float32)
         grad_logits = grad_scaled_logits * beta
+        if SILU_LOGITS:
+            logits = tl.load(
+                logits_ptr
+                + row_offsets[:, None] * logits_row_stride
+                + atom_offsets[None, :],
+                mask=row_mask[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            sigmoid = 1.0 / (1.0 + tl.exp(-logits))
+            silu_derivative = 2.0 * sigmoid * (1.0 + logits * (1.0 - sigmoid))
+            grad_logits *= silu_derivative
         tl.store(
             grad_logits_ptr
             + row_offsets[:, None] * grad_logits_row_stride
@@ -390,9 +407,13 @@ if TRITON_AVAILABLE:
                 mask=row_mask[:, None],
                 other=0.0,
             ).to(tl.float32)
+            assignment_logits = logits
+            if SILU_LOGITS:
+                sigmoid = 1.0 / (1.0 + tl.exp(-logits))
+                assignment_logits = 2.0 * logits * sigmoid
             tl.store(
                 grad_beta_rows_ptr + row_offsets,
-                tl.sum(grad_scaled_logits * logits, axis=1),
+                tl.sum(grad_scaled_logits * assignment_logits, axis=1),
                 mask=row_mask,
             )
 
@@ -453,6 +474,7 @@ if TRITON_AVAILABLE:
         input_row_stride,
         output_row_stride,
         n_cols: tl.constexpr,
+        SILU_LOGITS: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
         row = tl.program_id(0)
@@ -462,9 +484,12 @@ if TRITON_AVAILABLE:
         values = tl.load(
             input_ptr + row * input_row_stride + columns,
             mask=mask,
-            other=-float("inf"),
+            other=0.0,
         ).to(tl.float32)
-        values = values * beta
+        if SILU_LOGITS:
+            sigmoid = 1.0 / (1.0 + tl.exp(-values))
+            values = 2.0 * values * sigmoid
+        values = tl.where(mask, values * beta, -float("inf"))
         values = values - tl.max(values, axis=0)
         numerator = tl.exp(values)
         denominator = tl.sum(numerator, axis=0)
@@ -522,6 +547,7 @@ if TRITON_AVAILABLE:
         grad_logits_row_stride,
         n_cols: tl.constexpr,
         COMPUTE_BETA_GRAD: tl.constexpr,
+        SILU_LOGITS: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
         row = tl.program_id(0)
@@ -545,15 +571,22 @@ if TRITON_AVAILABLE:
         beta = tl.load(beta_ptr).to(tl.float32)
         centered = grad_weights - tl.sum(grad_weights * weights, axis=0)
         grad_scaled_logits = weights * centered
+        assignment_logits = logits
+        grad_logits = beta * grad_scaled_logits
+        if SILU_LOGITS:
+            sigmoid = 1.0 / (1.0 + tl.exp(-logits))
+            assignment_logits = 2.0 * logits * sigmoid
+            silu_derivative = 2.0 * sigmoid * (1.0 + logits * (1.0 - sigmoid))
+            grad_logits *= silu_derivative
         tl.store(
             grad_logits_ptr + row * grad_logits_row_stride + columns,
-            beta * grad_scaled_logits,
+            grad_logits,
             mask=mask,
         )
         if COMPUTE_BETA_GRAD:
             tl.store(
                 grad_beta_ptr + row,
-                tl.sum(grad_scaled_logits * logits, axis=0),
+                tl.sum(grad_scaled_logits * assignment_logits, axis=0),
             )
 
 
@@ -1259,7 +1292,7 @@ def _normalized_assignment(
     return normalized, inverse_norm, logits
 
 
-def _row_scaled_softmax(input: Tensor, beta: Tensor) -> Tensor:
+def _row_scaled_softmax(input: Tensor, beta: Tensor, silu_logits: bool = False) -> Tensor:
     _require_triton()
     if input.ndim != 2 or not input.is_cuda:
         raise ValueError("Triton softmax expects a CUDA matrix")
@@ -1276,6 +1309,7 @@ def _row_scaled_softmax(input: Tensor, beta: Tensor) -> Tensor:
         input.stride(0),
         output.stride(0),
         n_cols=columns,
+        SILU_LOGITS=silu_logits,
         BLOCK=block,
         num_warps=warps,
     )
@@ -1325,6 +1359,7 @@ def _row_scaled_softmax_backward(
     grad_weights: Tensor,
     beta: Tensor,
     compute_beta_grad: bool,
+    silu_logits: bool = False,
 ) -> tuple[Tensor, Tensor | None]:
     _require_triton()
     logits = logits.contiguous()
@@ -1361,6 +1396,7 @@ def _row_scaled_softmax_backward(
         grad_logits.stride(0),
         n_cols=columns,
         COMPUTE_BETA_GRAD=compute_beta_grad,
+        SILU_LOGITS=silu_logits,
         BLOCK=block,
         num_warps=warps,
     )
@@ -1374,6 +1410,7 @@ def _dictionary_route_fused_forward(
     dictionary_value: Tensor,
     beta: Tensor,
     eps: float,
+    silu_logits: bool,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     _require_triton()
     original_shape = input.shape
@@ -1430,6 +1467,7 @@ def _dictionary_route_fused_forward(
         BLOCK_K=32,
         BLOCK_ATOMS=64,
         DICTIONARY_SIZE=512,
+        SILU_LOGITS=silu_logits,
         num_warps=8,
         num_stages=2,
     )
@@ -1478,6 +1516,7 @@ def _dictionary_route_fused_backward(
     grad_output: Tensor,
     input_shape: torch.Size,
     compute_beta_grad: bool,
+    silu_logits: bool,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
     _require_triton()
     dictionary_key = dictionary_key.contiguous()
@@ -1540,6 +1579,7 @@ def _dictionary_route_fused_backward(
         routing_dim=routing_dim,
         IS_BF16=normalized.dtype == torch.bfloat16,
         COMPUTE_BETA_GRAD=compute_beta_grad,
+        SILU_LOGITS=silu_logits,
         BLOCK_R=block_r,
         BLOCK_ROWS=block_rows,
         BLOCK_K=32,
@@ -1565,10 +1605,11 @@ def _dictionary_route_triton_forward(
     dictionary_value: Tensor,
     beta: Tensor,
     eps: float,
+    silu_logits: bool,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     if _can_use_fused_dictionary_route(input, dictionary_key, dictionary_value):
         return _dictionary_route_fused_forward(
-            input, dictionary_key, dictionary_value, beta, eps
+            input, dictionary_key, dictionary_value, beta, eps, silu_logits
         )
     original_shape = input.shape
     flat = input.contiguous().view(-1, original_shape[-1])
@@ -1588,7 +1629,7 @@ def _dictionary_route_triton_forward(
     else:
         normalized, input_inverse_norm = _row_l2_normalize(flat, eps)
         logits = normalized @ dictionary_key.contiguous()
-    weights = _row_scaled_softmax(logits, beta)
+    weights = _row_scaled_softmax(logits, beta, silu_logits)
     reconstructed = weights @ dictionary_value.transpose(0, 1).contiguous()
     output, output_inverse_norm = _row_l2_normalize(reconstructed, eps)
     return (
@@ -1610,6 +1651,7 @@ class _DictionaryRouteFunction(torch.autograd.Function):
         dictionary_value: Tensor,
         beta: Tensor,
         eps: float,
+        silu_logits: bool,
     ) -> Tensor:
         ctx.used_fused_route = _can_use_fused_dictionary_route(
             input, dictionary_key, dictionary_value
@@ -1621,7 +1663,9 @@ class _DictionaryRouteFunction(torch.autograd.Function):
             logits,
             weights,
             output_inverse_norm,
-        ) = _dictionary_route_triton_forward(input, dictionary_key, dictionary_value, beta, eps)
+        ) = _dictionary_route_triton_forward(
+            input, dictionary_key, dictionary_value, beta, eps, silu_logits
+        )
         ctx.save_for_backward(
             dictionary_key,
             dictionary_value,
@@ -1634,6 +1678,7 @@ class _DictionaryRouteFunction(torch.autograd.Function):
             output_inverse_norm,
         )
         ctx.input_shape = input.shape
+        ctx.silu_logits = silu_logits
         return output
 
     @staticmethod
@@ -1673,6 +1718,7 @@ class _DictionaryRouteFunction(torch.autograd.Function):
                     grad_output,
                     ctx.input_shape,
                     ctx.needs_input_grad[3],
+                    ctx.silu_logits,
                 )
             )
             return (
@@ -1680,6 +1726,7 @@ class _DictionaryRouteFunction(torch.autograd.Function):
                 grad_dictionary_key,
                 grad_dictionary_value,
                 grad_beta,
+                None,
                 None,
             )
         flat_grad_output = grad_output.contiguous().view(-1, grad_output.shape[-1])
@@ -1689,14 +1736,19 @@ class _DictionaryRouteFunction(torch.autograd.Function):
         grad_weights = grad_reconstructed @ dictionary_value.contiguous()
         grad_dictionary_value = grad_reconstructed.transpose(0, 1) @ weights
         grad_logits, grad_beta = _row_scaled_softmax_backward(
-            logits, weights, grad_weights, beta, ctx.needs_input_grad[3]
+            logits,
+            weights,
+            grad_weights,
+            beta,
+            ctx.needs_input_grad[3],
+            ctx.silu_logits,
         )
         grad_normalized = grad_logits @ dictionary_key.transpose(0, 1).contiguous()
         grad_dictionary_key = normalized.transpose(0, 1) @ grad_logits
         grad_input = _row_l2_normalize_backward(
             normalized, input_inverse_norm, grad_normalized
         ).view(ctx.input_shape)
-        return grad_input, grad_dictionary_key, grad_dictionary_value, grad_beta, None
+        return grad_input, grad_dictionary_key, grad_dictionary_value, grad_beta, None, None
 
 
 def dictionary_route_triton(
@@ -1705,6 +1757,7 @@ def dictionary_route_triton(
     dictionary_value: Tensor,
     beta: Tensor,
     eps: float = 1e-6,
+    silu_logits: bool = False,
 ) -> Tensor:
     """Triton forward and backward for the dictionary feature map.
 
@@ -1714,7 +1767,9 @@ def dictionary_route_triton(
     PyTorch autograd graph for the row-wise operations.
     """
 
-    return _DictionaryRouteFunction.apply(input, dictionary_key, dictionary_value, beta, eps)
+    return _DictionaryRouteFunction.apply(
+        input, dictionary_key, dictionary_value, beta, eps, silu_logits
+    )
 
 
 def _routed_attention_triton_forward(

@@ -17,7 +17,7 @@ from double_attention import DoubleAttentionLM, MHA4LM, experiment_config
 from double_attention.data import load_token_splits
 
 
-VARIANTS = ("a1", "qk2-s1", "qk1-s2", "qk2-s2", "qk4-s4", "mha4")
+VARIANTS = ("a1", "a1-silu", "qk2-s1", "qk1-s2", "qk2-s2", "qk4-s4", "mha4")
 
 
 def stable_seed(name: str, base_seed: int) -> int:
